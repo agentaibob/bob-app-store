@@ -1,0 +1,631 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: bob-network-monitor_server_1
+      APP_PORT: 8124
+
+  collector:
+    image: python:3.12-slim
+    restart: on-failure
+    stop_grace_period: 30s
+    init: true
+    network_mode: host
+    pid: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${APP_DATA_DIR}/data:/data
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat > /data/collector.py << 'PYEOF'
+        import json, time, os, re, socket, threading
+        OUT = '/data/netstats.json'
+        APP_OUT = '/data/appstats.json'
+        STATE = '/data/collector_state.json'
+        DIAG_OUT = '/data/diag.json'
+        DOCKER = '/var/run/docker.sock'
+
+        def docker_get(path):
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(3)
+                s.connect(DOCKER)
+                s.sendall(('GET %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' % path).encode())
+                data = b''
+                while True:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                s.close()
+                if b'\r\n\r\n' not in data:
+                    return None
+                headers, body = data.split(b'\r\n\r\n', 1)
+                if b'transfer-encoding: chunked' in headers.lower():
+                    out = b''
+                    while body:
+                        nl = body.find(b'\r\n')
+                        if nl < 0:
+                            break
+                        try:
+                            size = int(body[:nl].split(b';')[0], 16)
+                        except Exception:
+                            break
+                        body = body[nl + 2:]
+                        if size == 0:
+                            break
+                        out += body[:size]
+                        body = body[size + 2:]
+                    body = out
+                return json.loads(body.decode('utf-8', errors='replace'))
+            except Exception:
+                return None
+
+        def main_iface():
+            try:
+                with open('/proc/net/route') as f:
+                    for line in f.readlines()[1:]:
+                        p = line.split()
+                        if len(p) > 3 and p[1] == '00000000' and p[3] != '00000000':
+                            return p[0]
+            except Exception:
+                pass
+            return None
+
+        def iface_bytes_from_file(path, iface):
+            try:
+                with open(path) as f:
+                    for line in f.readlines()[2:]:
+                        if ':' not in line:
+                            continue
+                        name, data = line.split(':', 1)
+                        if name.strip() == iface:
+                            p = data.split()
+                            return int(p[0]), int(p[8])
+            except Exception:
+                pass
+            return None
+
+        def host_veth_ifindex_map():
+            res = {}
+            try:
+                for name in os.listdir('/sys/class/net'):
+                    if not name.startswith('veth'):
+                        continue
+                    try:
+                        with open('/sys/class/net/%s/ifindex' % name) as f:
+                            res[int(f.read().strip())] = name
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            return res
+
+        def container_eth0_iflink(pid):
+            try:
+                with open('/proc/%s/root/sys/class/net/eth0/iflink' % pid) as f:
+                    return int(f.read().strip())
+            except Exception:
+                return None
+
+        def container_eth0_bytes(pid):
+            return iface_bytes_from_file('/proc/%s/net/dev' % pid, 'eth0')
+
+        def nice_app_name(c):
+            labels = c.get('Labels') or {}
+            project = labels.get('com.docker.compose.project') or ''
+            if project:
+                return project.replace('-', ' ').replace('_', ' ').strip().title()
+            names = c.get('Names') or []
+            raw = names[0] if names else (c.get('Id', '')[:12])
+            raw = str(raw).lstrip('/')
+            n = re.sub(r'_\d+$', '', raw)
+            n = n.replace('-', ' ').replace('_', ' ')
+            return n.strip().title() or raw
+
+        def container_pid(cid):
+            info = docker_get('/containers/%s/json' % cid)
+            if not info:
+                return 0
+            try:
+                return int((info.get('State') or {}).get('Pid') or 0)
+            except Exception:
+                return 0
+
+        def _parse_tcp_peers(path, v6=False):
+            """Parse /proc/net/tcp{6} for established remote IPs (return set of 'ip:port')."""
+            peers = set()
+            try:
+                with open(path) as f:
+                    for line in f.readlines()[1:]:
+                        parts = line.split()
+                        if len(parts) < 4:
+                            continue
+                        st = parts[3]
+                        if st != '01':  # only ESTABLISHED
+                            continue
+                        rem = parts[2]
+                        if ':' not in rem:
+                            continue
+                        hx, hxp = rem.rsplit(':', 1)
+                        try:
+                            port = int(hxp, 16)
+                        except Exception:
+                            continue
+                        if port == 0:
+                            continue
+                        if v6:
+                            # /proc/net/tcp6: 32 hex chars = 4 x 32-bit words,
+                            # each word in HOST (little-endian) byte order.
+                            if len(hx) != 32:
+                                continue
+                            words32 = [hx[i:i+8] for i in range(0, 32, 8)]
+                            try:
+                                swapped = ''.join(bytes.fromhex(w)[::-1].hex() for w in words32)
+                                ip = socket.inet_ntop(socket.AF_INET6, bytes.fromhex(swapped))
+                            except Exception:
+                                continue
+                            # IPv4-mapped ::ffff:a.b.c.d -> show as plain IPv4
+                            m4 = re.match(r'^::ffff:(\d+\.\d+\.\d+\.\d+)$', ip)
+                            if m4:
+                                ip = m4.group(1)
+                        else:
+                            if len(hx) != 8:
+                                continue
+                            ip = '.'.join(str(int(hx[i:i+2], 16)) for i in (6, 4, 2, 0))
+                        if ip.startswith('0.') or ip == '0.0.0.0':
+                            continue
+                        peers.add('%s:%d' % (ip, port))
+            except Exception:
+                pass
+            return peers
+
+        def container_peers(pid):
+            """Remote IPs the container is connected to (established TCP)."""
+            peers = set()
+            if not pid:
+                return peers
+            peers |= _parse_tcp_peers('/proc/%s/net/tcp' % pid)
+            peers |= _parse_tcp_peers('/proc/%s/net/tcp6' % pid, v6=True)
+            return peers
+
+        # ---- Reverse DNS (PTR) with cache + background worker ----
+        dns_cache = {}      # ip -> hostname or None
+        DNS_TTL = 3600      # 1h
+
+        def _is_private(ip):
+            if ip.startswith('10.') or ip.startswith('127.') or ip.startswith('192.168.'):
+                return True
+            if ip.startswith('172.'):
+                try:
+                    return 16 <= int(ip.split('.')[1]) <= 31
+                except Exception:
+                    return True
+            if ip.startswith('169.254.'):
+                return True
+            if ':' in ip:  # skip IPv6 PTR (slow, rarely useful)
+                return True
+            return False
+
+        def lookup_peer(ip):
+            """PTR reverse DNS with cache; returns hostname or None."""
+            now = time.time()
+            hit = dns_cache.get(ip)
+            if hit is not None and now - hit[1] < DNS_TTL:
+                return hit[0]
+            name = None
+            if not _is_private(ip):
+                try:
+                    name = socket.gethostbyaddr(ip)[0]
+                except Exception:
+                    name = None
+            dns_cache[ip] = (name, now)
+            return name
+
+        def dns_worker():
+            """Background: resolve unknown peer IPs without blocking the collector loop."""
+            while True:
+                try:
+                    ips = set()
+                    for v in list(peers_map.values()):
+                        for p in v:
+                            ip = p.rpartition(':')[0]
+                            if ip not in dns_cache:
+                                ips.add(ip)
+                    for ip in sorted(ips)[:8]:
+                        lookup_peer(ip)
+                except Exception:
+                    pass
+                time.sleep(10)
+
+        def fmt_peer(p):
+            """'ip:port' -> {'ip': ip, 'port': port, 'host': hostname} for table columns."""
+            ip, _, port = p.rpartition(':')
+            name = lookup_peer(ip)
+            return {'ip': ip, 'port': port, 'host': name}
+
+        def build_app_stats():
+            """Returns (apps, diag). apps = [{name, rx, tx}] with real container counters."""
+            diag = {
+                'docker_sock': os.path.exists(DOCKER),
+                'docker_ok': False,
+                'containers': 0,
+                'mapped': 0,
+                'unmapped_veth': 0,
+                'method': 'none',
+                'error': ''
+            }
+            veth_idx = host_veth_ifindex_map()
+            host_veth_bytes = {}
+            try:
+                with open('/proc/net/dev') as f:
+                    for line in f.readlines()[2:]:
+                        if ':' not in line:
+                            continue
+                        name, data = line.split(':', 1)
+                        name = name.strip()
+                        if name.startswith('veth'):
+                            p = data.split()
+                            host_veth_bytes[name] = (int(p[0]), int(p[8]))
+            except Exception as e:
+                diag['error'] = 'host_veth:' + str(e)
+
+            containers = docker_get('/containers/json')
+            if not isinstance(containers, list) or not containers:
+                diag['error'] = diag.get('error') or 'docker_api_empty'
+                apps = []
+                for vn, (rx, tx) in host_veth_bytes.items():
+                    apps.append({'name': vn, 'rx': tx, 'tx': rx})
+                diag['unmapped_veth'] = len(apps)
+                diag['method'] = 'veth_fallback'
+                return apps, diag
+
+            diag['docker_ok'] = True
+            diag['containers'] = len(containers)
+            diag['method'] = 'iflink+counters'
+            agg = {}
+            used_veth = set()
+            leftover_veths = dict(host_veth_bytes)
+
+            def match_veth_by_counters(erx, etx):
+                """Host veth RX == container TX, host veth TX == container RX."""
+                for vn, (vr, vt) in list(leftover_veths.items()):
+                    if vt == erx and vr == etx:
+                        return vn
+                return None
+
+            for c in containers:
+                cid = c.get('Id') or ''
+                app = nice_app_name(c)
+                pid = container_pid(cid)
+                if not pid:
+                    continue
+                iflink = container_eth0_iflink(pid)
+                eth = container_eth0_bytes(pid)
+                rx = tx = 0
+                vn = None
+
+                # 1) iflink pairing (best, but AppArmor may block /proc/<pid>/root)
+                if iflink and iflink in veth_idx:
+                    vn = veth_idx[iflink]
+
+                # 2) counter pairing with correct orientation (fallback)
+                if vn is None and eth:
+                    vn = match_veth_by_counters(eth[0], eth[1])
+
+                if vn is not None and vn in leftover_veths:
+                    used_veth.add(vn)
+                    del leftover_veths[vn]
+                    diag['mapped'] += 1
+
+                # Prefer container-side counters (true app RX/TX)
+                if eth:
+                    rx, tx = eth
+                elif vn is not None:
+                    hr, ht = host_veth_bytes.get(vn, (0, 0))
+                    rx, tx = ht, hr  # swap: host RX = container TX
+                else:
+                    continue
+
+                if app not in agg:
+                    agg[app] = {'rx': 0, 'tx': 0}
+                agg[app]['rx'] += rx
+                agg[app]['tx'] += tx
+
+            apps = [{'name': n, 'rx': v['rx'], 'tx': v['tx']} for n, v in sorted(agg.items())]
+            diag['unmapped_veth'] = len(leftover_veths)
+            for vn, (hr, ht) in leftover_veths.items():
+                apps.append({'name': vn, 'rx': ht, 'tx': hr})
+            return apps, diag
+
+        baseline, app_baseline = {}, {}
+        if os.path.exists(STATE):
+            try:
+                with open(STATE) as f:
+                    s = json.load(f)
+                baseline = s.get('baseline', {}) or {}
+                app_baseline = s.get('apps', {}) or {}
+            except Exception:
+                pass
+        prev = {}
+
+        # Cache the docker→name mapping (expensive); refresh every MAP_TTL seconds.
+        # The veth byte counters themselves are read fresh every loop iteration.
+        MAP_TTL = 12
+        name_map = {}      # veth_name -> display name
+        peers_map = {}     # display name -> sorted list of remote IPs
+        name_map_ts = 0.0
+        last_diag = {}
+
+        def refresh_name_map():
+            """Rebuild veth→name mapping via docker API (expensive, so cached)."""
+            global name_map, name_map_ts, last_diag, peers_map
+            now = time.time()
+            if now - name_map_ts < MAP_TTL and name_map:
+                return
+            try:
+                veth_idx = host_veth_ifindex_map()
+                host_veth_bytes = {}
+                with open('/proc/net/dev') as f:
+                    for line in f.readlines()[2:]:
+                        if ':' not in line:
+                            continue
+                        nm, data = line.split(':', 1)
+                        nm = nm.strip()
+                        if nm.startswith('veth'):
+                            p = data.split()
+                            host_veth_bytes[nm] = (int(p[0]), int(p[8]))
+                containers = docker_get('/containers/json')
+                mapping = {}
+                peers = {}
+                used = set()
+                if isinstance(containers, list):
+                    for c in containers:
+                        cid = c.get('Id') or ''
+                        app = nice_app_name(c)
+                        pid = container_pid(cid)
+                        if not pid:
+                            continue
+                        iflink = container_eth0_iflink(pid)
+                        eth = container_eth0_bytes(pid)
+                        vn = None
+                        if iflink and iflink in veth_idx:
+                            vn = veth_idx[iflink]
+                        if vn is None and eth:
+                            for vname, (vr, vt) in host_veth_bytes.items():
+                                if vname in used:
+                                    continue
+                                if vt == eth[0] and vr == eth[1]:
+                                    vn = vname
+                                    break
+                        if vn and vn not in used:
+                            mapping[vn] = app
+                            used.add(vn)
+                            # collect remote IPs for this app
+                            for peer in container_peers(pid):
+                                peers.setdefault(app, set()).add(peer)
+                for vname in host_veth_bytes:
+                    if vname not in mapping:
+                        mapping[vname] = vname
+                name_map = mapping
+                peers_map = {k: sorted(v) for k, v in peers.items()}
+                last_diag = {
+                    'docker_sock': os.path.exists(DOCKER),
+                    'docker_ok': bool(containers),
+                    'containers': len(containers) if isinstance(containers, list) else 0,
+                    'mapped': len(used),
+                    'unmapped_veth': sum(1 for v in host_veth_bytes if v not in mapping or mapping[v] == v),
+                    'method': 'iflink+counters',
+                    'error': ''
+                }
+            except Exception as e:
+                last_diag = {'docker_sock': os.path.exists(DOCKER), 'docker_ok': False,
+                             'containers': 0, 'mapped': 0, 'unmapped_veth': 0,
+                             'method': 'fallback', 'error': str(e)}
+            name_map_ts = now
+
+        refresh_name_map()
+        threading.Thread(target=dns_worker, daemon=True).start()
+
+        while True:
+            now = time.time()
+            iface = main_iface()
+            st = iface_bytes_from_file('/proc/net/dev', iface) if iface else None
+            rx_total = tx_total = rx_rate = tx_rate = 0.0
+            if st:
+                rx, tx = st
+                if iface not in baseline:
+                    baseline[iface] = {'rx': rx, 'tx': tx}
+                rx_total = max(0, rx - baseline[iface]['rx'])
+                tx_total = max(0, tx - baseline[iface]['tx'])
+                if iface in prev:
+                    dt = now - prev[iface][0]
+                    if dt > 0:
+                        rx_rate = max(0.0, (rx - prev[iface][1]) / dt)
+                        tx_rate = max(0.0, (tx - prev[iface][2]) / dt)
+                prev[iface] = (now, rx, tx)
+            try:
+                with open(OUT, 'w') as f:
+                    json.dump({'rx_total': rx_total, 'tx_total': tx_total, 'rx_rate': rx_rate, 'tx_rate': tx_rate, 'iface': iface}, f)
+            except Exception:
+                pass
+
+            # Refresh docker→name map occasionally (docker API is expensive)
+            refresh_name_map()
+
+            # Fresh veth byte counters each second, mapped via cached names
+            app_rows = []
+            try:
+                with open('/proc/net/dev') as f:
+                    veth_lines = []
+                    for line in f.readlines()[2:]:
+                        if ':' not in line:
+                            continue
+                        nm, data = line.split(':', 1)
+                        nm = nm.strip()
+                        if nm.startswith('veth'):
+                            p = data.split()
+                            if len(p) >= 9:
+                                veth_lines.append((nm, int(p[0]), int(p[8])))
+                # Aggregate by display name (multiple veths may share an app)
+                agg = {}
+                for vn, vr, vt in veth_lines:
+                    name = name_map.get(vn, vn)
+                    if name not in agg:
+                        agg[name] = {'rx': 0, 'tx': 0}
+                    # veth host RX = container TX, veth host TX = container RX
+                    agg[name]['rx'] += vt
+                    agg[name]['tx'] += vr
+                for name, vals in sorted(agg.items()):
+                    rx, tx = vals['rx'], vals['tx']
+                    if name not in app_baseline:
+                        app_baseline[name] = {'rx': rx, 'tx': tx}
+                    arx = max(0, rx - app_baseline[name]['rx'])
+                    atx = max(0, tx - app_baseline[name]['tx'])
+                    arxr = atxr = 0.0
+                    if name in prev:
+                        dt = now - prev[name][0]
+                        if dt > 0:
+                            arxr = max(0.0, (rx - prev[name][1]) / dt)
+                            atxr = max(0.0, (tx - prev[name][2]) / dt)
+                    prev[name] = (now, rx, tx)
+                    peers = [fmt_peer(p) for p in (peers_map.get(name, []) or [])]
+                    app_rows.append({'name': name, 'rx_total': arx, 'tx_total': atx, 'rx_rate': arxr, 'tx_rate': atxr, 'peers': peers})
+            except Exception as e:
+                last_diag['error'] = 'veth_loop:' + str(e)
+
+            sa_rx = sum(x['rx_total'] for x in app_rows)
+            sa_tx = sum(x['tx_total'] for x in app_rows)
+            sys_row = {
+                'name': 'Pozosta\u0142e',
+                'rx_total': max(0, rx_total - sa_rx),
+                'tx_total': max(0, tx_total - sa_tx),
+                'rx_rate': max(0.0, rx_rate - sum(x['rx_rate'] for x in app_rows)),
+                'tx_rate': max(0.0, tx_rate - sum(x['tx_rate'] for x in app_rows))
+            }
+            try:
+                with open(APP_OUT, 'w') as f:
+                    json.dump({'apps': app_rows, 'system': sys_row, 'ts': now, 'diag': last_diag}, f)
+            except Exception:
+                pass
+            try:
+                with open(DIAG_OUT, 'w') as f:
+                    json.dump(last_diag, f)
+            except Exception:
+                pass
+            try:
+                with open(STATE, 'w') as f:
+                    json.dump({'baseline': baseline, 'apps': app_baseline}, f)
+            except Exception:
+                pass
+            time.sleep(1)
+        PYEOF
+        exec python3 /data/collector.py
+
+  server:
+    image: python:3.12-slim
+    restart: on-failure
+    stop_grace_period: 30s
+    init: true
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat > /data/widget_server.py << 'PYEOF'
+        import json, base64
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        STATS = '/data/netstats.json'
+        APP_STATS = '/data/appstats.json'
+        DIAG = '/data/diag.json'
+        PORT = 8124
+        VERSION = '1.0.26'
+        # HTML stored as base64 so docker-compose YAML stays valid
+        HTML = base64.b64decode(
+            'PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9InBsIj48aGVhZD4KPG1ldGEgY2hhcnNldD0idXRmLTgiPjxtZXRhIG5hbWU9InZpZXdwb3J0IiBjb250ZW50PSJ3aWR0aD1kZXZpY2Utd2lkdGgsaW5pdGlhbC1zY2FsZT0xIj4KPHRpdGxlPlZBVUxULVRFQyBORVRXT1JLIE1PTklUT1Igdl9fVkVSX188L3RpdGxlPgo8bGluayByZWw9InByZWNvbm5lY3QiIGhyZWY9Imh0dHBzOi8vZm9udHMuZ29vZ2xlYXBpcy5jb20iPgo8bGluayBocmVmPSJodHRwczovL2ZvbnRzLmdvb2dsZWFwaXMuY29tL2NzczI/ZmFtaWx5PVNoYXJlK1RlY2grTW9ubyZkaXNwbGF5PXN3YXAiIHJlbD0ic3R5bGVzaGVldCI+CjxzdHlsZT4KKntib3gtc2l6aW5nOmJvcmRlci1ib3h9Cmh0bWwsYm9keXttYXJnaW46MDtwYWRkaW5nOjA7YmFja2dyb3VuZDojMDcwNzA1O21pbi1oZWlnaHQ6MTAwJX0KYm9keXtmb250LWZhbWlseTonU2hhcmUgVGVjaCBNb25vJywnQ291cmllciBOZXcnLG1vbm9zcGFjZTtjb2xvcjojZmZiMDAwOwogIGJhY2tncm91bmQ6cmFkaWFsLWdyYWRpZW50KGVsbGlwc2UgYXQgNTAlIDMwJSwjMGQwZDA3IDAlLCMwNzA3MDUgNzAlKTsKICBwYWRkaW5nOjE0cHg7ZGlzcGxheTpmbGV4O2p1c3RpZnktY29udGVudDpjZW50ZXJ9CiNzY3JlZW57cG9zaXRpb246cmVsYXRpdmU7d2lkdGg6MTAwJTttYXgtd2lkdGg6MTA4MHB4O2JhY2tncm91bmQ6IzBhMGEwNTsKICBib3JkZXI6MTBweCBzb2xpZCAjM2EzZjJjO2JvcmRlci1yYWRpdXM6MjZweDtib3gtc2hhZG93OjAgMCA0MHB4IHJnYmEoMjU1LDE3NiwwLC4xNCksCiAgaW5zZXQgMCAwIDYwcHggcmdiYSgwLDAsMCwuOSk7cGFkZGluZzoyMnB4IDI0cHggMTZweDtvdmVyZmxvdzpoaWRkZW59CiNzY3JlZW46OmJlZm9yZXtjb250ZW50OicnO3Bvc2l0aW9uOmFic29sdXRlO2luc2V0OjA7cG9pbnRlci1ldmVudHM6bm9uZTt6LWluZGV4OjU7CiAgYmFja2dyb3VuZDpyZXBlYXRpbmctbGluZWFyLWdyYWRpZW50KDBkZWcscmdiYSgwLDAsMCwuMzIpIDAgMXB4LHRyYW5zcGFyZW50IDFweCAzcHgpOwogIG1peC1ibGVuZC1tb2RlOm11bHRpcGx5fQojc2NyZWVuOjphZnRlcntjb250ZW50OicnO3Bvc2l0aW9uOmFic29sdXRlO2luc2V0OjA7cG9pbnRlci1ldmVudHM6bm9uZTt6LWluZGV4OjY7CiAgYmFja2dyb3VuZDpyYWRpYWwtZ3JhZGllbnQoZWxsaXBzZSBhdCA1MCUgNTAlLHRyYW5zcGFyZW50IDU1JSxyZ2JhKDAsMCwwLC41NSkgMTAwJSk7CiAgYW5pbWF0aW9uOmZsaWNrZXIgOHMgaW5maW5pdGV9CkBrZXlmcmFtZXMgZmxpY2tlcnswJSwxMDAle29wYWNpdHk6Ljk3fTkyJXtvcGFjaXR5Oi45N305MyV7b3BhY2l0eTouODJ9OTQle29wYWNpdHk6Ljk3fTk3JXtvcGFjaXR5Oi45fTk4JXtvcGFjaXR5Oi45N319CiNzY3JlZW4+ZGl2LCAjc2NyZWVuPmgxLCAjc2NyZWVuPnRhYmxlLCAjc2NyZWVuPi5mb290e3Bvc2l0aW9uOnJlbGF0aXZlO3otaW5kZXg6Mjt0ZXh0LXNoYWRvdzowIDAgNnB4IHJnYmEoMjU1LDE3NiwwLC41NSksMCAwIDE4cHggcmdiYSgyNTUsMTc2LDAsLjIyKX0KaDF7Zm9udC1zaXplOjIxcHg7bWFyZ2luOjA7bGV0dGVyLXNwYWNpbmc6MXB4O2ZvbnQtd2VpZ2h0OjQwMH0KaDEgLnZlcntjb2xvcjojOGE2ZDJhO2ZvbnQtc2l6ZToxM3B4fQouc3Vie2NvbG9yOiNiODg2MGI7Zm9udC1zaXplOjEycHg7bWFyZ2luLXRvcDozcHg7bGV0dGVyLXNwYWNpbmc6LjVweH0KLnN1YiAub2t7Y29sb3I6I2ZmZDc2ZX0KLmN1cnNvcntkaXNwbGF5OmlubGluZS1ibG9jazt3aWR0aDo5cHg7aGVpZ2h0OjE0cHg7YmFja2dyb3VuZDojZmZiMDAwO21hcmdpbi1sZWZ0OjZweDt2ZXJ0aWNhbC1hbGlnbjotMnB4O2FuaW1hdGlvbjpibGluayAxLjFzIHN0ZXBzKDEpIGluZmluaXRlfQpAa2V5ZnJhbWVzIGJsaW5rezUwJXtvcGFjaXR5OjB9fQouY2FyZHN7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczpyZXBlYXQoYXV0by1maXQsbWlubWF4KDE1MHB4LDFmcikpO2dhcDoxMnB4O21hcmdpbjoxOHB4IDAgMjBweH0KLmNhcmR7Ym9yZGVyOjFweCBzb2xpZCAjN2E1ZjFlO2JhY2tncm91bmQ6cmdiYSgyNTUsMTc2LDAsLjA0NSk7Ym9yZGVyLXJhZGl1czo4cHg7cGFkZGluZzoxNHB4IDEwcHg7dGV4dC1hbGlnbjpjZW50ZXJ9Ci5jYXJkIC5sYWJlbHtmb250LXNpemU6MTFweDtjb2xvcjojYTg4NDJmO3RleHQtdHJhbnNmb3JtOnVwcGVyY2FzZTtsZXR0ZXItc3BhY2luZzoycHh9Ci5jYXJkIC52YWx1ZXtmb250LXNpemU6MjdweDttYXJnaW4tdG9wOjZweDtjb2xvcjojZmZkNzZlfQouY2FyZCAudW5pdHtmb250LXNpemU6MTJweDtjb2xvcjojOGE2ZDJhO21hcmdpbi10b3A6MnB4fQp0YWJsZXt3aWR0aDoxMDAlO2JvcmRlci1jb2xsYXBzZTpjb2xsYXBzZTtmb250LXNpemU6MTMuNXB4fQp0aCx0ZHtwYWRkaW5nOjdweCA5cHg7dGV4dC1hbGlnbjpjZW50ZXI7Ym9yZGVyOjFweCBzb2xpZCAjNWM0YTFjO2NvbG9yOiNmZmIwMDB9CnRoe2JhY2tncm91bmQ6cmdiYSgyNTUsMTc2LDAsLjEpO2NvbG9yOiNmZmQ3NmU7Zm9udC1zaXplOjExLjVweDt0ZXh0LXRyYW5zZm9ybTp1cHBlcmNhc2U7bGV0dGVyLXNwYWNpbmc6MS41cHg7Zm9udC13ZWlnaHQ6NDAwfQp0aC5ncm91cHtiYWNrZ3JvdW5kOnJnYmEoMjU1LDE3NiwwLC4xNil9Ci5hcHB7Zm9udC13ZWlnaHQ6NDAwO2NvbG9yOiNmZmU2YTM7dGV4dC1hbGlnbjpsZWZ0fQouZGlye2ZvbnQtc2l6ZToxMXB4O2NvbG9yOiM4YTZkMmF9Ci5kb3due2NvbG9yOiNmZmUwOGF9Ci51cHtjb2xvcjojYzhhNDRhfQouc3lzLXJvdyB0ZHtiYWNrZ3JvdW5kOnJnYmEoMjU1LDE3NiwwLC4wNyl9Ci5zeXMtcm93IHRkLmFwcHtjb2xvcjojZmZmMmNjfQoucGVlcnN7Zm9udC1zaXplOjEwLjVweDtsaW5lLWhlaWdodDoxLjQ7bWF4LXdpZHRoOjI4MHB4O2NvbG9yOiNkNGE5NGZ9Ci5wZWVye3doaXRlLXNwYWNlOm5vcm1hbDt3b3JkLWJyZWFrOmJyZWFrLXdvcmR9Ci5wZWVyLm11dGVke2NvbG9yOiM2YjU1MjB9Ci5wb3J0c3tmb250LXNpemU6MTAuNXB4O2xpbmUtaGVpZ2h0OjEuNDtjb2xvcjojZDRhOTRmfQouaXB7Y29sb3I6IzhhNmQyYTtmb250LXNpemU6MTBweH0KLnVwZGF0ZWQsLmRpYWd7Y29sb3I6IzhhNmQyYTtmb250LXNpemU6MTEuNXB4O21hcmdpbi10b3A6MTBweDtsZXR0ZXItc3BhY2luZzouNXB4fQouZm9vdHttYXJnaW4tdG9wOjE2cHg7cGFkZGluZy10b3A6MTBweDtib3JkZXItdG9wOjFweCBkYXNoZWQgIzVjNGExYztmb250LXNpemU6MTAuNXB4O2NvbG9yOiM3YTVmMWU7bGV0dGVyLXNwYWNpbmc6MXB4O2Rpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjtmbGV4LXdyYXA6d3JhcDtnYXA6NnB4fQouZm9vdCAucmFke2NvbG9yOiNmZmQ3NmV9Cjwvc3R5bGU+PC9oZWFkPjxib2R5Pgo8ZGl2IGlkPSJzY3JlZW4iPgo8aDE+4piiIFZBVUxULVRFQyBORVRXT1JLIE1PTklUT1IgPHNwYW4gY2xhc3M9InZlciI+dl9fVkVSX188L3NwYW4+PC9oMT4KPGRpdiBjbGFzcz0ic3ViIj5QSVAtT1MgdjEuMC4yNCAmbWRhc2g7IFdBU1RFTEFORCBFRElUSU9OIDxzcGFuIGNsYXNzPSJvayI+fCBTVEFUVVM6IE9OTElORTwvc3Bhbj48c3BhbiBjbGFzcz0iY3Vyc29yIj48L3NwYW4+PC9kaXY+CjxkaXYgY2xhc3M9ImNhcmRzIj4KPGRpdiBjbGFzcz0iY2FyZCI+PGRpdiBjbGFzcz0ibGFiZWwiPlBvYmllcmFuaWU8L2Rpdj48ZGl2IGNsYXNzPSJ2YWx1ZSIgaWQ9InJ4LXJhdGUiPi08L2Rpdj48ZGl2IGNsYXNzPSJ1bml0IiBpZD0icngtcmF0ZS11Ij48L2Rpdj48L2Rpdj4KPGRpdiBjbGFzcz0iY2FyZCI+PGRpdiBjbGFzcz0ibGFiZWwiPld5c3lsYW5pZTwvZGl2PjxkaXYgY2xhc3M9InZhbHVlIiBpZD0idHgtcmF0ZSI+LTwvZGl2PjxkaXYgY2xhc3M9InVuaXQiIGlkPSJ0eC1yYXRlLXUiPjwvZGl2PjwvZGl2Pgo8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJsYWJlbCI+T2RlYnJhbm88L2Rpdj48ZGl2IGNsYXNzPSJ2YWx1ZSIgaWQ9InJ4LXRvdGFsIj4tPC9kaXY+PGRpdiBjbGFzcz0idW5pdCIgaWQ9InJ4LXRvdGFsLXUiPjwvZGl2PjwvZGl2Pgo8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJsYWJlbCI+V3lzbGFubzwvZGl2PjxkaXYgY2xhc3M9InZhbHVlIiBpZD0idHgtdG90YWwiPi08L2Rpdj48ZGl2IGNsYXNzPSJ1bml0IiBpZD0idHgtdG90YWwtdSI+PC9kaXY+PC9kaXY+CjwvZGl2Pgo8dGFibGU+Cjx0aGVhZD4KPHRyPgo8dGggcm93c3Bhbj0iMiI+QXBsaWthY2phPC90aD4KPHRoIHJvd3NwYW49IjIiPlBvbGFjemVuaWEgKElQKTwvdGg+Cjx0aCByb3dzcGFuPSIyIj5Qb3J0PC90aD4KPHRoIGNvbHNwYW49IjIiIGNsYXNzPSJncm91cCI+UHJlZGtvc2M8L3RoPgo8dGggY29sc3Bhbj0iMiIgY2xhc3M9Imdyb3VwIj5TdW1hPC90aD4KPC90cj4KPHRyPgo8dGg+UG9iaWVyYW5pZTwvdGg+PHRoPld5c3lsYW5pZTwvdGg+PHRoPlBvYmllcmFuaWU8L3RoPjx0aD5XeXN5bGFuaWU8L3RoPgo8L3RyPgo8L3RoZWFkPgo8dGJvZHkgaWQ9InJvd3MiPjwvdGJvZHk+CjwvdGFibGU+CjxkaXYgY2xhc3M9InVwZGF0ZWQiIGlkPSJ1cGRhdGVkIj48L2Rpdj4KPGRpdiBjbGFzcz0iZGlhZyIgaWQ9ImRpYWciPjwvZGl2Pgo8ZGl2IGNsYXNzPSJmb290Ij48c3Bhbj7CqSAyMDc3IFZBVUxULVRFQyBJTkRVU1RSSUVTICZtZGFzaDsgTkVUV09SSyBESVZJU0lPTjwvc3Bhbj48c3BhbiBjbGFzcz0icmFkIj7imKIgQUxMIFNZU1RFTVMgTk9NSU5BTDwvc3Bhbj48L2Rpdj4KPC9kaXY+CjxzY3JpcHQ+CmZ1bmN0aW9uIHJhdGUodil7dj0rdnx8MDtpZih2Pj0xMDQ4NTc2KXJldHVyblsodi8xMDQ4NTc2KS50b0ZpeGVkKDEpLCdNQi9zJ107aWYodj49MTAyNClyZXR1cm5bKHYvMTAyNCkudG9GaXhlZCgxKSwna0IvcyddO3JldHVyblt2LnRvRml4ZWQoMCksJ0IvcyddfQpmdW5jdGlvbiB0b3RhbCh2KXt2PSt2fHwwO2lmKHY+PTEwNzM3NDE4MjQpcmV0dXJuWyh2LzEwNzM3NDE4MjQpLnRvRml4ZWQoMiksJ0dCJ107aWYodj49MTA0ODU3NilyZXR1cm5bKHYvMTA0ODU3NikudG9GaXhlZCgxKSwnTUInXTtpZih2Pj0xMDI0KXJldHVyblsodi8xMDI0KS50b0ZpeGVkKDApLCdrQiddO3JldHVyblt2LnRvRml4ZWQoMCksJ0InXX0KZnVuY3Rpb24gcm93KG5hbWUsc3lzKXsKdmFyIHIxPXJhdGUobmFtZS5yeF9yYXRlKSxyMj1yYXRlKG5hbWUudHhfcmF0ZSksdDE9dG90YWwobmFtZS5yeF90b3RhbCksdDI9dG90YWwobmFtZS50eF90b3RhbCk7CnZhciBwZWVycz0obmFtZS5wZWVyc3x8W10pLnNsaWNlKDAsNCk7CnZhciBpcEh0bWwsIHBvcnRIdG1sOwppZihwZWVycy5sZW5ndGgpewogIGlwSHRtbD1wZWVycy5tYXAoZnVuY3Rpb24ocCl7cmV0dXJuICc8ZGl2IGNsYXNzPSJwZWVyIj4nKyhwLmhvc3Q/cC5ob3N0Kyc8YnI+PHNwYW4gY2xhc3M9ImlwIj4nK3AuaXArJzwvc3Bhbj4nOnAuaXApKyc8L2Rpdj4nO30pLmpvaW4oJycpOwogIHBvcnRIdG1sPXBlZXJzLm1hcChmdW5jdGlvbihwKXtyZXR1cm4gJzxkaXYgY2xhc3M9InBlZXIiPicrcC5wb3J0Kyc8L2Rpdj4nO30pLmpvaW4oJycpOwp9ZWxzZXtpcEh0bWw9JzxkaXYgY2xhc3M9InBlZXIgbXV0ZWQiPi08L2Rpdj4nO3BvcnRIdG1sPSc8ZGl2IGNsYXNzPSJwZWVyIG11dGVkIj4tPC9kaXY+Jzt9CnJldHVybiAnPHRyJysoc3lzPycgY2xhc3M9InN5cy1yb3ciJzonJykrJz48dGQgY2xhc3M9ImFwcCI+JytuYW1lLm5hbWUrJzwvdGQ+JworJzx0ZCBjbGFzcz0icGVlcnMiPicraXBIdG1sKyc8L3RkPicKKyc8dGQgY2xhc3M9InBvcnRzIj4nK3BvcnRIdG1sKyc8L3RkPicKKyc8dGQgY2xhc3M9ImRvd24iPicrcjFbMF0rJyAnK3IxWzFdKyc8L3RkPjx0ZCBjbGFzcz0idXAiPicrcjJbMF0rJyAnK3IyWzFdKyc8L3RkPicKKyc8dGQgY2xhc3M9ImRvd24iPicrdDFbMF0rJyAnK3QxWzFdKyc8L3RkPjx0ZCBjbGFzcz0idXAiPicrdDJbMF0rJyAnK3QyWzFdKyc8L3RkPjwvdHI+JzsKfQpmdW5jdGlvbiByZW5kZXIoKXsKUHJvbWlzZS5hbGwoWwpmZXRjaCgnL2FwaS90b3RhbHMnKS50aGVuKGZ1bmN0aW9uKHIpe3JldHVybiByLmpzb24oKX0pLApmZXRjaCgnL2FwaS9zdGF0cycpLnRoZW4oZnVuY3Rpb24ocil7cmV0dXJuIHIuanNvbigpfSksCmZldGNoKCcvYXBpL2RpYWcnKS50aGVuKGZ1bmN0aW9uKHIpe3JldHVybiByLmpzb24oKX0pLmNhdGNoKGZ1bmN0aW9uKCl7cmV0dXJuIHt9fSkKXSkudGhlbihmdW5jdGlvbihkKXsKdmFyIHRvdD1kWzBdfHx7fSwgc3Q9ZFsxXXx8e30sIGRpYWc9ZFsyXXx8c3QuZGlhZ3x8e307CnZhciByMT1yYXRlKHRvdC5yeF9yYXRlfHwwKSwgcjI9cmF0ZSh0b3QudHhfcmF0ZXx8MCksIHQxPXRvdGFsKHRvdC5yeF90b3RhbHx8MCksIHQyPXRvdGFsKHRvdC50eF90b3RhbHx8MCk7CmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdyeC1yYXRlJykudGV4dENvbnRlbnQ9cjFbMF07IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdyeC1yYXRlLXUnKS50ZXh0Q29udGVudD1yMVsxXTsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3R4LXJhdGUnKS50ZXh0Q29udGVudD1yMlswXTsgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3R4LXJhdGUtdScpLnRleHRDb250ZW50PXIyWzFdOwpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgncngtdG90YWwnKS50ZXh0Q29udGVudD10MVswXTsgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3J4LXRvdGFsLXUnKS50ZXh0Q29udGVudD10MVsxXTsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3R4LXRvdGFsJykudGV4dENvbnRlbnQ9dDJbMF07IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd0eC10b3RhbC11JykudGV4dENvbnRlbnQ9dDJbMV07CnZhciBodG1sPScnLCBzeXM9c3Quc3lzdGVtLCBhcHBzPXN0LmFwcHN8fFtdOwppZihzeXMpe2h0bWwrPXJvdyhzeXMsdHJ1ZSl9CmFwcHMuZm9yRWFjaChmdW5jdGlvbihhKXtodG1sKz1yb3coYSxmYWxzZSl9KTsKaWYoIWFwcHMubGVuZ3RoKSBodG1sKz0nPHRyPjx0ZCBjb2xzcGFuPSI3Ij5UcndhIHBpZXJ3c3p5IHBvbWlhci4uLjwvdGQ+PC90cj4nOwpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgncm93cycpLmlubmVySFRNTD1odG1sOwp2YXIgdHM9c3QudHM/bmV3IERhdGUoc3QudHMqMTAwMCkudG9Mb2NhbGVUaW1lU3RyaW5nKCdwbC1QTCcpOictJzsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3VwZGF0ZWQnKS50ZXh0Q29udGVudD0nQWt0dWFsaXphY2phOiAnK3RzOwpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZGlhZycpLnRleHRDb250ZW50PSdEaWFnOiBkb2NrZXI9JysoZGlhZy5kb2NrZXJfb2s/J09LJzonTk8nKSsnIG1ldGhvZD0nKyhkaWFnLm1ldGhvZHx8Jz8nKSsnIG1hcHBlZD0nKyhkaWFnLm1hcHBlZHx8MCkrJyB1bm1hcHBlZF92ZXRoPScrKGRpYWcudW5tYXBwZWRfdmV0aHx8MCkrKGRpYWcuZXJyb3I/KCcgZXJyPScrZGlhZy5lcnJvcik6JycpOwp9KS5jYXRjaChmdW5jdGlvbigpe30pOwp9CnJlbmRlcigpOyBzZXRJbnRlcnZhbChyZW5kZXIsMTAwMCk7Cjwvc2NyaXB0PjwvYm9keT48L2h0bWw+Cg=='
+        ).decode('utf-8').replace('__VER__', VERSION)
+
+        def fr(bps):
+            if bps >= 1048576: return ('%.1f' % (bps/1048576.0), 'MB/s')
+            if bps >= 1024: return ('%.1f' % (bps/1024.0), 'kB/s')
+            return ('%.0f' % bps, 'B/s')
+
+        def fb(n):
+            if n >= 1073741824: return ('%.1f' % (n/1073741824.0), 'GB')
+            if n >= 1048576: return ('%.1f' % (n/1048576.0), 'MB')
+            if n >= 1024: return ('%.0f' % (n/1024.0), 'kB')
+            return (str(int(n)), 'B')
+
+        def loadj(path):
+            try:
+                with open(path) as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+
+        def totals():
+            """Single source of truth: system + all apps summed (used by widget AND www cards)."""
+            a = loadj(APP_STATS)
+            apps = a.get('apps', []) or []
+            sysr = a.get('system', {}) or {}
+            def _f(x):
+                try:
+                    return float(x or 0)
+                except Exception:
+                    return 0.0
+            return {
+                'rx_rate': _f(sysr.get('rx_rate')) + sum(_f(x.get('rx_rate')) for x in apps),
+                'tx_rate': _f(sysr.get('tx_rate')) + sum(_f(x.get('tx_rate')) for x in apps),
+                'rx_total': _f(sysr.get('rx_total')) + sum(_f(x.get('rx_total')) for x in apps),
+                'tx_total': _f(sysr.get('tx_total')) + sum(_f(x.get('tx_total')) for x in apps),
+            }
+
+        class H(BaseHTTPRequestHandler):
+            def _json(self, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path == '/widgets/network':
+                    s = totals()
+                    rv, ru = fb(s.get('rx_total', 0)); tv, tu = fb(s.get('tx_total', 0))
+                    rrv, rru = fr(s.get('rx_rate', 0)); trv, tru = fr(s.get('tx_rate', 0))
+                    self._json({'type': 'four-stats', 'refresh': '5s', 'link': '', 'items': [
+                        {'title': 'Pobieranie', 'text': rrv, 'subtext': rru},
+                        {'title': 'Wysylanie', 'text': trv, 'subtext': tru},
+                        {'title': 'Odebrano', 'text': rv, 'subtext': ru},
+                        {'title': 'Wyslano', 'text': tv, 'subtext': tu}]})
+                elif self.path == '/api/totals':
+                    self._json(totals())
+                elif self.path == '/api/stats':
+                    self._json(loadj(APP_STATS))
+                elif self.path == '/api/diag':
+                    d = loadj(DIAG)
+                    if not d:
+                        d = loadj(APP_STATS).get('diag', {})
+                    self._json(d)
+                elif self.path in ('/', '/index.html'):
+                    body = HTML.encode('utf-8')
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html; charset=utf-8')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        HTTPServer(('0.0.0.0', PORT), H).serve_forever()
+        PYEOF
+        exec python3 /data/widget_server.py

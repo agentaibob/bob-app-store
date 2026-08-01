@@ -1,0 +1,43 @@
+manifestVersion: 1
+id: bob-garmin-monitor
+name: Garmin Monitor
+tagline: Ride stats, health and year totals from Garmin Connect
+icon: https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/svg/1f6b4.svg
+category: Utilities
+version: "1.0.5"
+port: 8125
+description: >-
+  Garmin Connect dashboard and home-screen widget. Log in once with your
+  Garmin account (tokens stored locally), then track daily ride km, monthly
+  and yearly totals, steps vs daily goal, resting heart rate, Body Battery
+  and physiological stress. Web dashboard updates every 60 seconds, widget
+  refreshes live on the home screen.
+developer: Bob
+website: https://github.com/grochowadawida-cyber/bob-app-store
+submitter: Tomek
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+widgets:
+  - id: "garmin"
+    type: "four-stats"
+    refresh: "5s"
+    endpoint: "server:8125/widgets/garmin"
+    link: ""
+    example:
+      type: "four-stats"
+      link: ""
+      items:
+        - title: "Dziś"
+          text: "10.1"
+          subtext: "km"
+        - title: "Rok 2026"
+          text: "1637"
+          subtext: "km"
+        - title: "Kroki"
+          text: "62%"
+          subtext: "3746 / 6000"
+        - title: "Body Batt."
+          text: "25"
+          subtext: "/100"

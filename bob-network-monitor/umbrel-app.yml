@@ -1,0 +1,45 @@
+manifestVersion: 1
+id: bob-network-monitor
+name: Network Monitor
+tagline: Real-time system and per-app network traffic
+icon: https://raw.githubusercontent.com/grochowadawida-cyber/bob-app-store/main/bob-network-monitor/icon.svg
+category: Utilities
+version: "1.0.26"
+port: 8124
+description: >-
+  Real-time network traffic monitor for the entire umbrelOS system.
+  Home-screen widget shows live download/upload rates and totals.
+  Web dashboard lists each installed app with 1-second refresh:
+  live speeds, data totals, and the remote IPs each app is connected
+  to (with ports and reverse-DNS service names). Uses host network
+  counters and container interface pairing for accurate per-app names.
+  New apps appear automatically.
+developer: Bob
+website: https://github.com/grochowadawida-cyber/bob-app-store
+submitter: Tomek
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+widgets:
+  - id: "network"
+    type: "four-stats"
+    refresh: "5s"
+    endpoint: "server:8124/widgets/network"
+    link: ""
+    example:
+      type: "four-stats"
+      link: ""
+      items:
+        - title: "Pobieranie"
+          text: "13.1"
+          subtext: "MB/s"
+        - title: "Wysyłanie"
+          text: "2.2"
+          subtext: "MB/s"
+        - title: "Odebrano"
+          text: "5.1"
+          subtext: "MB"
+        - title: "Wysłano"
+          text: "20.0"
+          subtext: "MB"

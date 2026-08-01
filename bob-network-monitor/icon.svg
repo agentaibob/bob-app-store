@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="caseGrad" cx="50%" cy="35%" r="80%">
+      <stop offset="0%" stop-color="#4a5532"/>
+      <stop offset="55%" stop-color="#333b22"/>
+      <stop offset="100%" stop-color="#1c2113"/>
+    </radialGradient>
+    <radialGradient id="screenGrad" cx="50%" cy="42%" r="75%">
+      <stop offset="0%" stop-color="#14200a"/>
+      <stop offset="100%" stop-color="#050a02"/>
+    </radialGradient>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <pattern id="scanlines" width="4" height="4" patternUnits="userSpaceOnUse">
+      <rect width="4" height="2" fill="#000" opacity="0.28"/>
+    </pattern>
+  </defs>
+
+  <!-- Pip-Boy case -->
+  <rect x="10" y="10" width="492" height="492" rx="84" fill="url(#caseGrad)" stroke="#15180d" stroke-width="10"/>
+  <!-- corner screws -->
+  <g fill="#565f3c" stroke="#1c2113" stroke-width="3">
+    <circle cx="52" cy="52" r="14"/>
+    <circle cx="460" cy="52" r="14"/>
+    <circle cx="52" cy="460" r="14"/>
+    <circle cx="460" cy="460" r="14"/>
+  </g>
+  <g stroke="#22281a" stroke-width="3">
+    <line x1="45" y1="52" x2="59" y2="52"/><line x1="52" y1="45" x2="52" y2="59"/>
+    <line x1="453" y1="52" x2="467" y2="52"/><line x1="460" y1="45" x2="460" y2="59"/>
+    <line x1="45" y1="460" x2="59" y2="460"/><line x1="52" y1="453" x2="52" y2="467"/>
+    <line x1="453" y1="460" x2="467" y2="460"/><line x1="460" y1="453" x2="460" y2="467"/>
+  </g>
+
+  <!-- Screen bezel -->
+  <rect x="58" y="58" width="396" height="396" rx="52" fill="#0d1107" stroke="#5d6b3a" stroke-width="10"/>
+
+  <!-- Screen -->
+  <g clip-path="url(#screenClip)">
+    <clipPath id="screenClip">
+      <rect x="66" y="66" width="380" height="380" rx="46"/>
+    </clipPath>
+    <rect x="66" y="66" width="380" height="380" rx="46" fill="url(#screenGrad)"/>
+    <rect x="66" y="66" width="380" height="380" rx="46" fill="url(#scanlines)"/>
+
+    <!-- amber phosphor elements -->
+    <g filter="url(#glow)" fill="none" stroke="#ffb000" stroke-linecap="round">
+      <!-- network links -->
+      <path d="M150 220 C 190 170, 230 190, 256 256" stroke-width="7" opacity="0.85"/>
+      <path d="M362 220 C 322 170, 282 190, 256 256" stroke-width="7" opacity="0.85"/>
+      <path d="M150 300 C 190 350, 230 330, 256 256" stroke-width="7" opacity="0.6"/>
+      <path d="M362 300 C 322 350, 282 330, 256 256" stroke-width="7" opacity="0.6"/>
+      <!-- download arrow (top) -->
+      <path d="M256 84 L256 152 M256 152 L238 134 M256 152 L274 134" stroke-width="8" opacity="0.95"/>
+      <!-- upload arrow (bottom) -->
+      <path d="M256 428 L256 360 M256 360 L238 378 M256 360 L274 378" stroke-width="8" opacity="0.95"/>
+    </g>
+    <!-- nodes -->
+    <g fill="#ffb000" filter="url(#glow)">
+      <circle cx="256" cy="256" r="20"/>
+      <circle cx="150" cy="220" r="12" opacity="0.9"/>
+      <circle cx="362" cy="220" r="12" opacity="0.9"/>
+      <circle cx="150" cy="300" r="9" opacity="0.6"/>
+      <circle cx="362" cy="300" r="9" opacity="0.6"/>
+    </g>
+    <g fill="#0d1107" filter="url(#glow)">
+      <circle cx="256" cy="256" r="9"/>
+    </g>
+
+    <!-- mini bar chart -->
+    <g fill="#ffb000" opacity="0.8" filter="url(#glow)">
+      <rect x="96" y="330" width="16" height="34" rx="3"/>
+      <rect x="120" y="318" width="16" height="46" rx="3"/>
+      <rect x="144" y="336" width="16" height="28" rx="3"/>
+      <rect x="352" y="320" width="16" height="44" rx="3"/>
+      <rect x="376" y="332" width="16" height="32" rx="3"/>
+      <rect x="400" y="324" width="16" height="40" rx="3"/>
+    </g>
+
+    <!-- status line -->
+    <g stroke="#ffb000" opacity="0.8">
+      <line x1="96" y1="96" x2="280" y2="96" stroke-width="5"/>
+      <line x1="96" y1="112" x2="230" y2="112" stroke-width="3" opacity="0.5"/>
+    </g>
+    <!-- blinking cursor block -->
+    <rect x="330" y="90" width="14" height="22" fill="#ffb000" opacity="0.9">
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="1.2s" repeatCount="indefinite"/>
+    </rect>
+  </g>
+
+  <!-- case bottom label bar -->
+  <rect x="140" y="478" width="232" height="20" rx="10" fill="#22281a" stroke="#4a5532" stroke-width="2"/>
+  <rect x="140" y="480" width="232" height="16" rx="8" fill="none"/>
+  <g fill="#9aa86a" font-family="monospace" font-size="12" text-anchor="middle">
+    <text x="256" y="493">PIP-OS v1.0</text>
+  </g>
+</svg>
