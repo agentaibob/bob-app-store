@@ -2,9 +2,9 @@ manifestVersion: 1
 id: bob-garmin-monitor
 name: Garmin Monitor
 tagline: Ride stats, health and year totals from Garmin Connect
-icon: https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/svg/1f6b4.svg
+icon: https://raw.githubusercontent.com/grochowadawida-cyber/bob-app-store/main/bob-garmin-monitor/icon.svg
 category: Utilities
-version: "1.0.5"
+version: "1.0.6"
 port: 8125
 description: >-
   Garmin Connect dashboard and home-screen widget. Log in once with your

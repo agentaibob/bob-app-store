@@ -42,7 +42,7 @@ services:
         DATA_JSON = os.path.join(DATA_DIR, "garmin_data.json")
         UI_FILE = os.path.join(DATA_DIR, "garmin_ui.html")
         PORT = int(os.environ.get("GARMIN_PORT", "8125"))
-        VERSION = "1.0.5"
+        VERSION = "1.0.6"
         REFRESH_S = 900  # odświeżanie danych co 15 min
 
         BIKE_TYPES = ("cycling", "road_biking")
