@@ -2,7 +2,7 @@ manifestVersion: 1
 id: bob-garmin-monitor
 name: Garmin Monitor
 tagline: Ride stats, health and year totals from Garmin Connect
-icon: https://raw.githubusercontent.com/grochowadawida-cyber/bob-app-store/main/bob-garmin-monitor/icon.svg
+icon: https://raw.githubusercontent.com/agentaibob/bob-app-store/main/bob-garmin-monitor/icon.svg
 category: Utilities
 version: "1.0.6"
 port: 8125
@@ -13,7 +13,7 @@ description: >-
   and physiological stress. Web dashboard updates every 60 seconds, widget
   refreshes live on the home screen.
 developer: Bob
-website: https://github.com/grochowadawida-cyber/bob-app-store
+website: https://github.com/agentaibob/bob-app-store
 submitter: Tomek
 dependencies: []
 path: ""

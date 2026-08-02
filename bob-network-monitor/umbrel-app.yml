@@ -2,7 +2,7 @@ manifestVersion: 1
 id: bob-network-monitor
 name: Network Monitor
 tagline: Real-time system and per-app network traffic
-icon: https://raw.githubusercontent.com/grochowadawida-cyber/bob-app-store/main/bob-network-monitor/icon.svg
+icon: https://raw.githubusercontent.com/agentaibob/bob-app-store/main/bob-network-monitor/icon.svg
 category: Utilities
 version: "1.0.26"
 port: 8124
@@ -15,7 +15,7 @@ description: >-
   counters and container interface pairing for accurate per-app names.
   New apps appear automatically.
 developer: Bob
-website: https://github.com/grochowadawida-cyber/bob-app-store
+website: https://github.com/agentaibob/bob-app-store
 submitter: Tomek
 dependencies: []
 path: ""

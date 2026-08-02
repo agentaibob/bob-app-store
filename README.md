@@ -1,7 +1,7 @@
 # Bob App Store — aplikacje dla umbrelOS
 
 Community App Store z aplikacjami autorstwa Boba. Dodaj URL:
-`https://github.com/grochowadawida-cyber/bob-app-store`
+`https://github.com/agentaibob/bob-app-store`
 
 ![Netmon](https://img.shields.io/badge/netmon-1.0.26-green) ![Garmin](https://img.shields.io/badge/garmin-1.0.4-green)
 
