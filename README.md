@@ -3,7 +3,7 @@
 Community App Store z aplikacjami autorstwa Boba. Dodaj URL:
 `https://github.com/agentaibob/bob-app-store`
 
-![Netmon](https://img.shields.io/badge/netmon-1.0.26-green) ![Garmin](https://img.shields.io/badge/garmin-1.0.4-green)
+![Netmon](https://img.shields.io/badge/netmon-1.0.26-green) ![Garmin](https://img.shields.io/badge/garmin-1.0.4-green) ![Hermes Monitor](https://img.shields.io/badge/hermes_monitor-1.0.0-green)
 
 ---
 
@@ -41,6 +41,21 @@ Dashboard + home-screen widget for **Garmin Connect** data: daily rides, distanc
 - Port: 8125
 - In-app Garmin login form; tokens stored in `${APP_DATA_DIR}/data/.garminconnect`
 - Shows the **previous day's** data (consistent with the morning bike report)
+
+---
+
+## 3. Hermes Monitor (bob-hermes-monitor)
+
+Dashboard + home-screen widget for **Hermes Agent**: live gateway & profile status,
+token usage and cost, cron jobs, kanban board, API key health and logs.
+
+- Port: 8126
+- Reads Hermes data from `/opt/data` **read-only**; shows API keys by variable
+  **name only, never value**
+- Widget (four-stats): profile online, tokens today, cost today, active alerts
+- Endpoints: `/` (dashboard), `/api/health`, `/api/status`, `/api/sessions`,
+  `/api/usage`, `/api/cron/jobs`, `/api/kanban`, `/api/keys`, `/api/alerts`,
+  `/api/metrics/{name}`, `/widgets/hermes`
 
 ---
 

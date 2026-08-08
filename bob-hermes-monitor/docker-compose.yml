@@ -1,0 +1,776 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: bob-hermes-monitor_server_1
+      APP_PORT: 8126
+
+  server:
+    image: python:3.13-slim
+    restart: on-failure
+    stop_grace_period: 30s
+    init: true
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+      - /opt/data:/hermes-data:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+          cat > /data/hermes_server.py << 'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Hermes Monitor — serwer HTTP (stdlib) dla apki UmbrelOS bob-hermes-monitor.
+          Czyta dane Hermesa z /hermes-data (mount RO), zapisuje do /data.
+          Bez zewnętrznych zależności — tylko stdlib Pythona.
+          Endpoints: /, /api/*, /widgets/hermes
+          """
+
+          import base64
+          import json
+          import os
+          import re
+          import sqlite3
+          import threading
+          import time
+          import urllib.parse
+          from datetime import datetime, timezone, timedelta
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          from pathlib import Path
+
+          # --- Konfiguracja ------------------------------------------------------------
+          PORT = int(os.environ.get("HERMES_PORT", "8126"))
+          DATA_DIR = os.environ.get("HERMES_DATA_DIR", "/data")
+          HERMES_DATA = os.environ.get("HERMES_ROOT", "/hermes-data")
+          PROFILES_ROOT = os.path.join(HERMES_DATA, "profiles")
+
+          STATUS_POLL_SECONDS = 10
+          METRICS_POLL_SECONDS = 30
+          CET = timezone(timedelta(hours=2))  # CEST
+
+          MONITORED_PROFILES = [
+              p.strip()
+              for p in os.environ.get(
+                  "HERMES_MONITOR_PROFILES",
+                  "default,danka,gwo,poszukiwacz,programista,projektant,tester",
+              ).split(",")
+              if p.strip()
+          ]
+
+          # --- Strefy czasowe ---------------------------------------------------------
+          def _ts_to_iso(ts):
+              if ts is None:
+                  return None
+              if isinstance(ts, str):
+                  return ts
+              return datetime.fromtimestamp(ts, tz=CET).isoformat()
+
+          def _now_iso():
+              return datetime.now(CET).isoformat()
+
+          # --- Helpers -----------------------------------------------------------------
+          def _read_json(path):
+              try:
+                  if os.path.exists(path):
+                      with open(path) as f:
+                          return json.load(f)
+              except Exception:
+                  pass
+              return None
+
+          def _get_profile_home(profile):
+              if profile == "default":
+                  return HERMES_DATA
+              return os.path.join(PROFILES_ROOT, profile)
+
+          def _get_state_db_path(profile):
+              return os.path.join(_get_profile_home(profile), "state.db")
+
+          # --- Baza dashboardu ---------------------------------------------------------
+          def _get_dashboard_db():
+              return os.path.join(DATA_DIR, "dashboard.db")
+
+          def _db_connect(path=None, mode="rw"):
+              """Otwiera połączenie SQLite. mode='ro' dla odczytu, 'rw' dla zapisu."""
+              if path is None:
+                  path = _get_dashboard_db()
+              if mode == "ro":
+                  conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+              else:
+                  conn = sqlite3.connect(path)
+              conn.row_factory = sqlite3.Row
+              if mode == "rw":
+                  conn.execute("PRAGMA journal_mode=WAL")
+                  conn.execute("PRAGMA busy_timeout=5000")
+              return conn
+
+          def init_dashboard_db():
+              conn = _db_connect()
+              conn.executescript("""
+                  CREATE TABLE IF NOT EXISTS metrics_snapshots (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      ts REAL NOT NULL,
+                      metric TEXT NOT NULL,
+                      value REAL,
+                      extra TEXT
+                  );
+                  CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics_snapshots(ts);
+                  CREATE INDEX IF NOT EXISTS idx_metrics_name_ts ON metrics_snapshots(metric, ts);
+
+                  CREATE TABLE IF NOT EXISTS alerts (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      ts REAL NOT NULL,
+                      level TEXT NOT NULL,
+                      alert_id TEXT NOT NULL,
+                      message TEXT NOT NULL,
+                      acknowledged INTEGER DEFAULT 0,
+                      acknowledged_at REAL
+                  );
+                  CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
+              """)
+              conn.commit()
+              conn.close()
+
+          # --- Kolektor ----------------------------------------------------------------
+          def _parse_gateway_state(profile):
+              home = _get_profile_home(profile)
+              state_path = os.path.join(home, "gateway_state.json")
+              data = _read_json(state_path) or {}
+              gw_state = data.get("gateway_state") or data.get("state", "unknown")
+              return {
+                  "profile": profile,
+                  "running": gw_state == "running",
+                  "pid": data.get("pid"),
+                  "state": gw_state,
+                  "exit_reason": data.get("exit_reason"),
+                  "restart_requested": data.get("restart_requested", False),
+                  "active_agents": data.get("active_agents", 0),
+                  "updated_at": _ts_to_iso(data.get("updated_at")),
+              }
+
+          def _parse_cron_ticker(profile):
+              home = _get_profile_home(profile)
+              result = {"heartbeat_age_seconds": None, "last_success_age_seconds": None, "alive": False}
+              hb_path = os.path.join(home, "cron", "ticker_heartbeat")
+              if os.path.exists(hb_path):
+                  try:
+                      hb = float(open(hb_path).read().strip())
+                      result["heartbeat_age_seconds"] = time.time() - hb
+                      result["alive"] = result["heartbeat_age_seconds"] < 120
+                  except Exception:
+                      pass
+              return result
+
+          def _read_env_names(profile):
+              env_path = os.path.join(_get_profile_home(profile), ".env")
+              if not os.path.exists(env_path):
+                  return []
+              names = []
+              try:
+                  with open(env_path) as f:
+                      for line in f:
+                          line = line.strip()
+                          if line and not line.startswith("#") and "=" in line:
+                              names.append(line.split("=", 1)[0])
+              except Exception:
+                  pass
+              return names
+
+          def _parse_auth_status(profile):
+              auth_path = os.path.join(_get_profile_home(profile), "auth.json")
+              data = _read_json(auth_path) or {}
+              creds = data.get("credential_pool", {})
+              result = []
+              for provider, info in creds.items():
+                  if isinstance(info, dict):
+                      result.append({
+                          "provider": provider,
+                          "auth_type": info.get("auth_type"),
+                          "last_status": info.get("last_status"),
+                          "expires_at": _ts_to_iso(info.get("expires_at")),
+                          "request_count": info.get("request_count", 0),
+                          "last_error": info.get("last_error_message") or info.get("last_error"),
+                      })
+              return result
+
+          def _read_log_summary(profile, log_name, since_hours=1):
+              log_path = os.path.join(_get_profile_home(profile), "logs", log_name)
+              result = {"errors": 0, "warnings": 0, "last_entries": [], "path": str(log_path)}
+              if not os.path.exists(log_path):
+                  return result
+              cutoff = time.time() - since_hours * 3600
+              try:
+                  with open(log_path, errors="replace") as f:
+                      lines = f.readlines()
+                  recent = []
+                  for line in reversed(lines[-500:]):
+                      try:
+                          parts = line.split(" ", 3)
+                          if len(parts) >= 3:
+                              ts_str = f"{parts[0]} {parts[1].split(',')[0]}"
+                              dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                              dt = dt.replace(tzinfo=CET)
+                              if dt.timestamp() < cutoff:
+                                  break
+                              if "ERROR" in line:
+                                  result["errors"] += 1
+                              elif "WARNING" in line:
+                                  result["warnings"] += 1
+                              if len(recent) < 20:
+                                  recent.append(line.strip())
+                      except (ValueError, IndexError):
+                          pass
+                  result["last_entries"] = list(reversed(recent))
+              except Exception:
+                  pass
+              return result
+
+          def _get_sessions(profile, limit=20):
+              db_path = _get_state_db_path(profile)
+              if not os.path.exists(db_path):
+                  return []
+              try:
+                  conn = _db_connect(db_path, mode="ro")
+                  rows = conn.execute(
+                      """SELECT id, source, model, title, message_count, tool_call_count,
+                                input_tokens, output_tokens, cache_read_tokens, reasoning_tokens,
+                                estimated_cost_usd, actual_cost_usd, cost_status,
+                                started_at, ended_at, end_reason, last_activity_at,
+                                display_name, billing_provider, api_call_count
+                         FROM sessions ORDER BY started_at DESC LIMIT ?""",
+                      (limit,),
+                  ).fetchall()
+                  sessions = []
+                  for r in rows:
+                      sessions.append({
+                          "id": r["id"],
+                          "source": r["source"],
+                          "model": r["model"],
+                          "title": r["title"] or "(bez tytułu)",
+                          "display_name": r["display_name"],
+                          "message_count": r["message_count"],
+                          "tool_call_count": r["tool_call_count"],
+                          "api_call_count": r["api_call_count"],
+                          "tokens": {
+                              "input": r["input_tokens"],
+                              "output": r["output_tokens"],
+                              "cache_read": r["cache_read_tokens"],
+                              "reasoning": r["reasoning_tokens"],
+                              "total": (r["input_tokens"] or 0) + (r["output_tokens"] or 0),
+                          },
+                          "cost": {
+                              "estimated_usd": r["estimated_cost_usd"],
+                              "actual_usd": r["actual_cost_usd"],
+                              "status": r["cost_status"],
+                          },
+                          "billing_provider": r["billing_provider"],
+                          "started_at": _ts_to_iso(r["started_at"]),
+                          "ended_at": _ts_to_iso(r["ended_at"]),
+                          "end_reason": r["end_reason"],
+                          "last_activity_at": _ts_to_iso(r["last_activity_at"]),
+                      })
+                  conn.close()
+                  return sessions
+              except Exception:
+                  return []
+
+          def _get_usage_stats(profile, days=7):
+              db_path = _get_state_db_path(profile)
+              if not os.path.exists(db_path):
+                  return {"daily": [], "by_model": []}
+              try:
+                  conn = _db_connect(db_path, mode="ro")
+                  cutoff = time.time() - days * 86400
+                  daily_rows = conn.execute(
+                      """SELECT date(started_at, 'unixepoch') as day,
+                                COUNT(*) as session_count,
+                                SUM(input_tokens) as input_tokens,
+                                SUM(output_tokens) as output_tokens,
+                                SUM(reasoning_tokens) as reasoning_tokens,
+                                SUM(estimated_cost_usd) as estimated_cost_usd,
+                                SUM(actual_cost_usd) as actual_cost_usd
+                         FROM sessions WHERE started_at >= ?
+                         GROUP BY day ORDER BY day""",
+                      (cutoff,),
+                  ).fetchall()
+                  daily = [{
+                      "day": r["day"],
+                      "session_count": r["session_count"],
+                      "tokens": {"input": r["input_tokens"] or 0, "output": r["output_tokens"] or 0, "reasoning": r["reasoning_tokens"] or 0},
+                      "cost": {"estimated_usd": r["estimated_cost_usd"] or 0, "actual_usd": r["actual_cost_usd"] or 0},
+                  } for r in daily_rows]
+
+                  model_rows = conn.execute(
+                      """SELECT model, billing_provider,
+                                SUM(api_call_count) as calls,
+                                SUM(input_tokens) as input_tokens,
+                                SUM(output_tokens) as output_tokens,
+                                SUM(reasoning_tokens) as reasoning_tokens,
+                                SUM(estimated_cost_usd) as estimated_cost_usd
+                         FROM session_model_usage WHERE last_seen >= ?
+                         GROUP BY model ORDER BY estimated_cost_usd DESC""",
+                      (cutoff,),
+                  ).fetchall()
+                  by_model = [{
+                      "model": r["model"], "provider": r["billing_provider"],
+                      "api_calls": r["calls"],
+                      "tokens": {"input": r["input_tokens"] or 0, "output": r["output_tokens"] or 0, "reasoning": r["reasoning_tokens"] or 0},
+                      "estimated_cost_usd": r["estimated_cost_usd"] or 0,
+                  } for r in model_rows]
+
+                  conn.close()
+                  return {"daily": daily, "by_model": by_model}
+              except Exception:
+                  return {"daily": [], "by_model": []}
+
+          def _get_cron_jobs(profile):
+              home = _get_profile_home(profile)
+              exec_db = os.path.join(home, "cron", "executions.db")
+              if not os.path.exists(exec_db):
+                  return []
+              jobs = []
+              try:
+                  conn = _db_connect(exec_db, mode="ro")
+                  job_ids = conn.execute("SELECT DISTINCT job_id FROM executions ORDER BY job_id").fetchall()
+                  for jr in job_ids:
+                      jid = jr["job_id"]
+                      last_run = conn.execute(
+                          "SELECT status, started_at, finished_at, error FROM executions WHERE job_id=? ORDER BY started_at DESC LIMIT 1",
+                          (jid,),
+                      ).fetchone()
+                      cutoff = time.time() - 86400
+                      stats = conn.execute(
+                          """SELECT COUNT(*) as total,
+                                    SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success,
+                                    SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) as errors
+                             FROM executions WHERE job_id=? AND started_at>=?""",
+                          (jid, cutoff),
+                      ).fetchone()
+                      jobs.append({
+                          "job_id": jid, "name": jid, "schedule": None, "enabled": True,
+                          "last_run": {
+                              "status": last_run["status"] if last_run else "unknown",
+                              "started_at": _ts_to_iso(last_run["started_at"]) if last_run else None,
+                              "finished_at": _ts_to_iso(last_run["finished_at"]) if last_run else None,
+                              "error": last_run["error"] if last_run else None,
+                          } if last_run else None,
+                          "stats_24h": {
+                              "total": stats["total"] if stats else 0,
+                              "success": stats["success"] if stats else 0,
+                              "errors": stats["errors"] if stats else 0,
+                          } if stats else None,
+                      })
+                  conn.close()
+              except Exception:
+                  pass
+              return jobs
+
+          def _get_kanban_summary():
+              kanban_path = os.path.join(HERMES_DATA, "kanban", "boards", "hermes-monitor", "kanban.db")
+              if not os.path.exists(kanban_path):
+                  return {"tasks_by_status": {}, "recent_events": []}
+              try:
+                  conn = _db_connect(kanban_path, mode="ro")
+                  counts = conn.execute("SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status").fetchall()
+                  tasks_by_status = {r["status"]: r["cnt"] for r in counts}
+                  recent = conn.execute(
+                      """SELECT te.id, te.task_id, te.kind, te.created_at, t.title
+                         FROM task_events te JOIN tasks t ON t.id=te.task_id
+                         ORDER BY te.created_at DESC LIMIT 20"""
+                  ).fetchall()
+                  recent_events = [{
+                      "id": r["id"], "task_id": r["task_id"], "task_title": r["title"],
+                      "event": r["kind"], "ts": _ts_to_iso(r["created_at"]),
+                  } for r in recent]
+                  conn.close()
+                  return {"tasks_by_status": tasks_by_status, "recent_events": recent_events}
+              except Exception:
+                  return {"tasks_by_status": {}, "recent_events": []}
+
+          # --- Alerty (dashboard.db) ---------------------------------------------------
+          def _save_alert(alert_id, level, message):
+              conn = _db_connect()
+              existing = conn.execute("SELECT id FROM alerts WHERE alert_id=?", (alert_id,)).fetchone()
+              if not existing:
+                  conn.execute(
+                      "INSERT INTO alerts (ts, level, alert_id, message) VALUES (?,?,?,?)",
+                      (time.time(), level, alert_id, message),
+                  )
+                  conn.commit()
+              conn.close()
+
+          def _cleanup_resolved_alerts(active_ids):
+              conn = _db_connect()
+              all_alerts = conn.execute("SELECT id, alert_id FROM alerts").fetchall()
+              for row in all_alerts:
+                  if row["alert_id"] not in active_ids:
+                      conn.execute("DELETE FROM alerts WHERE id=?", (row["id"],))
+              conn.commit()
+              conn.close()
+
+          def _get_active_alerts():
+              conn = _db_connect()
+              rows = conn.execute(
+                  "SELECT * FROM alerts WHERE acknowledged=0 ORDER BY ts DESC LIMIT 50"
+              ).fetchall()
+              conn.close()
+              return [dict(r) for r in rows]
+
+          def _acknowledge_alert(db_id):
+              conn = _db_connect()
+              conn.execute("UPDATE alerts SET acknowledged=1, acknowledged_at=? WHERE id=?", (time.time(), db_id))
+              conn.commit()
+              conn.close()
+
+          def _save_metrics_batch(metrics):
+              if not metrics:
+                  return
+              conn = _db_connect()
+              ts = time.time()
+              conn.executemany(
+                  "INSERT INTO metrics_snapshots (ts, metric, value) VALUES (?,?,?)",
+                  [(ts, k, v) for k, v in metrics.items()],
+              )
+              conn.commit()
+              conn.close()
+
+          def _get_metric_history(metric, hours=24):
+              conn = _db_connect()
+              cutoff = time.time() - hours * 3600
+              rows = conn.execute(
+                  "SELECT ts, value FROM metrics_snapshots WHERE metric=? AND ts>=? ORDER BY ts",
+                  (metric, cutoff),
+              ).fetchall()
+              conn.close()
+              return [{"ts": r["ts"], "value": r["value"]} for r in rows]
+
+          # --- Kolektor (główna pętla) -------------------------------------------------
+          _snapshot = {}
+          _snapshot_lock = threading.Lock()
+
+          def _check_alerts(snapshot):
+              alerts = []
+              for prof in snapshot.get("profiles", []):
+                  gw = prof.get("gateway", {})
+                  if not gw.get("running"):
+                      aid = f"A1-{prof['profile']}"
+                      alerts.append({"id": aid, "level": "critical",
+                                     "message": f"Gateway profilu {prof['profile']} NIE DZIAŁA (state={gw.get('state')})"})
+                  ticker = prof.get("cron_ticker", {})
+                  if ticker.get("heartbeat_age_seconds") and ticker["heartbeat_age_seconds"] > 120:
+                      aid = f"A3-{prof['profile']}"
+                      alerts.append({"id": aid, "level": "critical",
+                                     "message": f"Cron scheduler {prof['profile']}: ticker martwy ({ticker['heartbeat_age_seconds']:.0f}s)"})
+                  logs = prof.get("logs", {})
+                  if logs.get("errors", {}).get("errors", 0) > 5:
+                      aid = f"A5-{prof['profile']}"
+                      alerts.append({"id": aid, "level": "warning",
+                                     "message": f"Profil {prof['profile']}: {logs['errors']['errors']} ERRORÓW w errors.log (1h)"})
+              for a in alerts:
+                  _save_alert(a["id"], a["level"], a["message"])
+              active_ids = {a["id"] for a in alerts}
+              _cleanup_resolved_alerts(active_ids)
+              return alerts
+
+          def collect_all():
+              global _snapshot
+              profiles_data = []
+              for profile in MONITORED_PROFILES:
+                  try:
+                      home = _get_profile_home(profile)
+                      if not os.path.isdir(home):
+                          continue
+                      gw = _parse_gateway_state(profile)
+                      ticker = _parse_cron_ticker(profile)
+                      auth = _parse_auth_status(profile)
+                      env_names = _read_env_names(profile)
+                      errors_log = _read_log_summary(profile, "errors.log", 1)
+                      agent_log = _read_log_summary(profile, "agent.log", 1)
+                      profiles_data.append({
+                          "profile": profile, "home": str(home),
+                          "gateway": gw, "cron_ticker": ticker,
+                          "auth_providers": auth, "api_keys_set": env_names,
+                          "logs": {"errors": errors_log, "agent_tracebacks": agent_log.get("errors", 0)},
+                      })
+                  except Exception:
+                      pass
+
+              active = [p for p in profiles_data if p["gateway"]["running"]]
+              total_agents = sum(p["gateway"]["active_agents"] for p in profiles_data)
+              total_errors = sum(p["logs"]["errors"]["errors"] for p in profiles_data)
+              total_warnings = sum(p["logs"]["errors"]["warnings"] for p in profiles_data)
+
+              snapshot = {
+                  "ts": time.time(), "ts_iso": _ts_to_iso(time.time()),
+                  "summary": {
+                      "profiles_total": len(profiles_data),
+                      "profiles_running": len(active),
+                      "active_agents": total_agents,
+                      "errors_1h": total_errors,
+                      "warnings_1h": total_warnings,
+                  },
+                  "profiles": profiles_data,
+                  "kanban": _get_kanban_summary(),
+              }
+              _check_alerts(snapshot)
+              _save_metrics_batch({
+                  "profiles_running": len(active),
+                  "active_agents": total_agents,
+                  "errors_1h": total_errors,
+                  "warnings_1h": total_warnings,
+              })
+              with _snapshot_lock:
+                  _snapshot = snapshot
+              return snapshot
+
+          def get_snapshot():
+              with _snapshot_lock:
+                  return _snapshot.copy() if _snapshot else None
+
+          def collector_loop():
+              time.sleep(2)
+              try:
+                  collect_all()
+              except Exception:
+                  pass
+              while True:
+                  try:
+                      collect_all()
+                  except Exception:
+                      pass
+                  time.sleep(STATUS_POLL_SECONDS)
+
+          # --- Widget ----------------------------------------------------------------
+          def widget_data():
+              snap = get_snapshot() or {}
+              summary = snap.get("summary", {})
+
+              def _fmt_tokens(n):
+                  n = n or 0
+                  if n >= 1_000_000:
+                      return f"{n/1_000_000:.1f}M"
+                  if n >= 1_000:
+                      return f"{n/1_000:.1f}k"
+                  return str(int(n))
+
+              # Tokeny dziś — pobierz z usage_stats dla domyślnego profilu
+              tokens_today = "--"
+              cost_today = "--"
+              try:
+                  usage = _get_usage_stats("programista", 1)
+                  if usage["daily"]:
+                      d = usage["daily"][-1]
+                      tokens_today = _fmt_tokens(d["tokens"]["input"])
+                      cost_today = f"{d['cost']['estimated_usd']:.2f}"
+              except Exception:
+                  pass
+
+              profiles_text = f"{summary.get('profiles_running', 0)}/{summary.get('profiles_total', 0)}"
+              profiles_sub = "aktywne" if summary.get('profiles_running') == summary.get('profiles_total') else "niepełne"
+
+              alerts = _get_active_alerts()
+              alerts_text = str(len(alerts))
+              alerts_sub = "aktywne" if alerts else "brak"
+
+              return {
+                  "type": "four-stats",
+                  "refresh": "5s",
+                  "link": "",
+                  "items": [
+                      {"title": "Profile online", "text": profiles_text, "subtext": profiles_sub},
+                      {"title": "Tokeny dziś", "text": tokens_today, "subtext": "input"},
+                      {"title": "Koszt dziś", "text": cost_today, "subtext": "USD"},
+                      {"title": "Alerty", "text": alerts_text, "subtext": alerts_sub},
+                  ],
+              }
+
+          # --- HTML frontend -----------------------------------------------------------
+          # Osadzony base64 — ten sam index.html co na hoście, ale z API_BASE='' (względne)
+          # Skrypt startowy w kontenerze podmieni API_BASE
+          HTML_B64 = "PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9InBsIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLjAiPgo8dGl0bGU+SGVybWVzIE1vbml0b3I8L3RpdGxlPgo8bGluayByZWw9InByZWNvbm5lY3QiIGhyZWY9Imh0dHBzOi8vZm9udHMuZ29vZ2xlYXBpcy5jb20iPgo8bGluayByZWw9InByZWNvbm5lY3QiIGhyZWY9Imh0dHBzOi8vZm9udHMuZ3N0YXRpYy5jb20iIGNyb3Nzb3JpZ2luPgo8bGluayBocmVmPSJodHRwczovL2ZvbnRzLmdvb2dsZWFwaXMuY29tL2NzczI/ZmFtaWx5PUludGVyOndnaHRANDAwOzUwMDs2MDA7NzAwJmZhbWlseT1KZXRCcmFpbnMrTW9ubzp3Z2h0QDQwMDs1MDA7NjAwOzcwMCZkaXNwbGF5PXN3YXAiIHJlbD0ic3R5bGVzaGVldCI+CjxzY3JpcHQgc3JjPSJodHRwczovL2Nkbi5qc2RlbGl2ci5uZXQvbnBtL2VjaGFydHNANS41LjEvZGlzdC9lY2hhcnRzLm1pbi5qcyI+PC9zY3JpcHQ+CjxzdHlsZT4KLyogPT09PT0gREVTSUdOIFRPS0VOUyA9PT09PSAqLwo6cm9vdCB7CiAgLyogQ29sb3JzICovCiAgLS1wcmltYXJ5OiAjMzhCREY4OwogIC0tc2Vjb25kYXJ5OiAjODE4Q0Y4OwogIC0tc3VjY2VzczogIzIyQzU1RTsKICAtLXdhcm5pbmc6ICNGNTlFMEI7CiAgLS1jcml0aWNhbDogI0VGNDQ0NDsKICAtLWluZm86ICMzOEJERjg7CiAgLS1uZXV0cmFsOiAjNjQ3NDhCOwogIC0tYmdSb290OiAjMEIxMTIxOwogIC0tYmdTdXJmYWNlOiAjMTExQjJFOwogIC0tYmdDYXJkOiAjMTcyMjM2OwogIC0tYmdIb3ZlcjogIzFFMkQ0NTsKICAtLWJvcmRlcjogIzFFMzM0RjsKICAtLWJvcmRlckxpZ2h0OiAjMkEzRjVDOwogIC0tdGV4dFByaW1hcnk6ICNFMkU4RjA7CiAgLS10ZXh0U2Vjb25kYXJ5OiAjOTRBM0I4OwogIC0tdGV4dE11dGVkOiAjNjQ3NDhCOwogIC0tdGV4dE9uUHJpbWFyeTogIzBCMTEyMTsKCiAgLyogU3BhY2luZyAqLwogIC0tc3BhY2UteHM6IDRweDsKICAtLXNwYWNlLXNtOiA4cHg7CiAgLS1zcGFjZS1tZDogMTJweDsKICAtLXNwYWNlLWxnOiAxNnB4OwogIC0tc3BhY2UteGw6IDI0cHg7CiAgLS1zcGFjZS0yeGw6IDMycHg7CiAgLS1zcGFjZS0zeGw6IDQ4cHg7CgogIC8qIFJhZGl1cyAqLwogIC0tcmFkaXVzLXNtOiA0cHg7CiAgLS1yYWRpdXMtbWQ6IDhweDsKICAtLXJhZGl1cy1sZzogMTJweDsKICAtLXJhZGl1cy14bDogMTZweDsKICAtLXJhZGl1cy1mdWxsOiA5OTk5cHg7Cn0KCi8qID09PT09IFJFU0VUID09PT09ICovCiosKjo6YmVmb3JlLCo6OmFmdGVye2JveC1zaXppbmc6Ym9yZGVyLWJveDttYXJnaW46MDtwYWRkaW5nOjB9Cmh0bWx7Zm9udC1zaXplOjE2cHg7LXdlYmtpdC1mb250LXNtb290aGluZzphbnRpYWxpYXNlZH0KYm9keXsKICBmb250LWZhbWlseTonSW50ZXInLHNhbnMtc2VyaWY7CiAgYmFja2dyb3VuZDp2YXIoLS1iZ1Jvb3QpOwogIGNvbG9yOnZhcigtLXRleHRQcmltYXJ5KTsKICBsaW5lLWhlaWdodDoxLjU7CiAgbWluLWhlaWdodDoxMDB2aDsKfQoKLyogPT09PT0gVFlQT0dSQVBIWSA9PT09PSAqLwouaGVhZGluZy14bHtmb250LWZhbWlseTonSW50ZXInLHNhbnMtc2VyaWY7Zm9udC1zaXplOjEuNzVyZW07Zm9udC13ZWlnaHQ6NzAwO2xpbmUtaGVpZ2h0OjEuMjtsZXR0ZXItc3BhY2luZzotMC4wMmVtfQouaGVhZGluZy1sZ3tmb250LWZhbWlseTonSW50ZXInLHNhbnMtc2VyaWY7Zm9udC1zaXplOjEuMjVyZW07Zm9udC13ZWlnaHQ6NjAwO2xpbmUtaGVpZ2h0OjEuMztsZXR0ZXItc3BhY2luZzotMC4wMWVtfQouaGVhZGluZy1tZHtmb250LWZhbWlseTonSW50ZXInLHNhbnMtc2VyaWY7Zm9udC1zaXplOjFyZW07Zm9udC13ZWlnaHQ6NjAwO2xpbmUtaGVpZ2h0OjEuNH0KLmJvZHktbWR7Zm9udC1mYW1pbHk6J0ludGVyJyxzYW5zLXNlcmlmO2ZvbnQtc2l6ZTowLjg3NXJlbTtmb250LXdlaWdodDo0MDA7bGluZS1oZWlnaHQ6MS41fQouYm9keS1zbXtmb250LWZhbWlseTonSW50ZXInLHNhbnMtc2VyaWY7Zm9udC1zaXplOjAuNzVyZW07Zm9udC13ZWlnaHQ6NDAwO2xpbmUtaGVpZ2h0OjEuNX0KLmxhYmVsLW1ke2ZvbnQtZmFtaWx5OidJbnRlcicsc2Fucy1zZXJpZjtmb250LXNpemU6MC43NXJlbTtmb250LXdlaWdodDo1MDA7bGluZS1oZWlnaHQ6MS40O2xldHRlci1zcGFjaW5nOjAuMDVlbTt0ZXh0LXRyYW5zZm9ybTp1cHBlcmNhc2V9Ci5sYWJlbC1sZ3tmb250LWZhbWlseTonSW50ZXInLHNhbnMtc2VyaWY7Zm9udC1zaXplOjAuODc1cmVtO2ZvbnQtd2VpZ2h0OjYwMDtsaW5lLWhlaWdodDoxLjQ7bGV0dGVyLXNwYWNpbmc6MC4wMmVtfQoubWV0cmljLXhse2ZvbnQtZmFtaWx5OidKZXRCcmFpbnMgTW9ubycsbW9ub3NwYWNlO2ZvbnQtc2l6ZToyLjI1cmVtO2ZvbnQtd2VpZ2h0OjcwMDtsaW5lLWhlaWdodDoxLjE7bGV0dGVyLXNwYWNpbmc6LTAuMDNlbX0KLm1ldHJpYy1sZ3tmb250LWZhbWlseTonSmV0QnJhaW5zIE1vbm8nLG1vbm9zcGFjZTtmb250LXNpemU6MS41cmVtO2ZvbnQtd2VpZ2h0OjYwMDtsaW5lLWhlaWdodDoxLjI7bGV0dGVyLXNwYWNpbmc6LTAuMDJlbX0KLm1ldHJpYy1tZHtmb250LWZhbWlseTonSmV0QnJhaW5zIE1vbm8nLG1vbm9zcGFjZTtmb250LXNpemU6MXJlbTtmb250LXdlaWdodDo1MDA7bGluZS1oZWlnaHQ6MS4zfQoubW9uby1zbXtmb250LWZhbWlseTonSmV0QnJhaW5zIE1vbm8nLG1vbm9zcGFjZTtmb250LXNpemU6MC43NXJlbTtmb250LXdlaWdodDo0MDA7bGluZS1oZWlnaHQ6MS42fQoKLyogPT09PT0gTEFZT1VUID09PT09ICovCi5jb250YWluZXJ7bWF4LXdpZHRoOjE0MDBweDttYXJnaW46MCBhdXRvO3BhZGRpbmc6MCB2YXIoLS1zcGFjZS14bCl9CkBtZWRpYShtYXgtd2lkdGg6NzY4cHgpey5jb250YWluZXJ7cGFkZGluZzowIHZhcigtLXNwYWNlLW1kKX19CgovKiA9PT09PSBUT1AgQkFSID09PT09ICovCiN0b3BiYXJ7CiAgcG9zaXRpb246c3RpY2t5O3RvcDowO3otaW5kZXg6MTAwOwogIGJhY2tncm91bmQ6dmFyKC0tYmdTdXJmYWNlKTsKICBib3JkZXItYm90dG9tOjFweCBzb2xpZCB2YXIoLS1ib3JkZXIpOwogIGhlaWdodDo1NnB4Owp9CiN0b3BiYXIgLmNvbnRhaW5lcnsKICBkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpzcGFjZS1iZXR3ZWVuOwogIGhlaWdodDoxMDAlOwp9Ci50b3BiYXItbGVmdHtkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2dhcDp2YXIoLS1zcGFjZS1tZCl9Ci50b3BiYXItbG9nb3sKICB3aWR0aDoxMHB4O2hlaWdodDoxMHB4O2JvcmRlci1yYWRpdXM6dmFyKC0tcmFkaXVzLWZ1bGwpOwogIGJhY2tncm91bmQ6dmFyKC0tc3VjY2Vzcyk7CiAgYW5pbWF0aW9uOnB1bHNlIDJzIGluZmluaXRlOwp9Ci50b3BiYXItcmlnaHR7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtnYXA6dmFyKC0tc3BhY2UtbGcpfQojY2xvY2t7Zm9udC1mYW1pbHk6J0pldEJyYWlucyBNb25vJyxtb25vc3BhY2U7Zm9udC1zaXplOjAuODc1cmVtO2NvbG9yOnZhcigtLXRleHRTZWNvbmRhcnkpfQoucmVmcmVzaC1pbmRpY2F0b3J7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtnYXA6dmFyKC0tc3BhY2UteHMpO2NvbG9yOnZhcigtLXRleHRNdXRlZCl9Ci5yZWZyZXNoLWluZGljYXRvciAuZG90e3dpZHRoOjZweDtoZWlnaHQ6NnB4O2JvcmRlci1yYWRpdXM6NTAlO2JhY2tncm91bmQ6dmFyKC0tcHJpbWFyeSl9CgovKiA9PT09PSBTVEFUVVMgU1RSSVAgPT09PT0gKi8KI3N0YXR1cy1zdHJpcHsKICBiYWNrZ3JvdW5kOnZhcigtLWJnU3VyZmFjZSk7CiAgYm9yZGVyLWJvdHRvbToxcHggc29saWQgdmFyKC0tYm9yZGVyKTsKfQojc3RhdHVzLXN0cmlwIC5jb250YWluZXJ7CiAgZGlzcGxheTpmbGV4O2dhcDp2YXIoLS1zcGFjZS1zbSk7cGFkZGluZzp2YXIoLS1zcGFjZS1zbSkgMDsKICBvdmVyZmxvdy14OmF1dG87Cn0KLnN0YXR1cy1jaGlwewogIGRpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOnZhcigtLXNwYWNlLXhzKTsKICBwYWRkaW5nOjRweCAxMHB4O2JvcmRlci1yYWRpdXM6dmFyKC0tcmFkaXVzLWZ1bGwpOwogIGJhY2tncm91bmQ6dmFyKC0tYmdDYXJkKTtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWJvcmRlcik7CiAgd2hpdGUtc3BhY2U6bm93cmFwOwp9Ci5zdGF0dXMtY2hpcCAuZG90e3dpZHRoOjhweDtoZWlnaHQ6OHB4O2JvcmRlci1yYWRpdXM6NTAlO2ZsZXgtc2hyaW5rOjB9Ci5zdGF0dXMtY2hpcCAuZG90Lm9ubGluZXtiYWNrZ3JvdW5kOnZhcigtLXN1Y2Nlc3MpfQouc3RhdHVzLWNoaXAgLmRvdC5vZmZsaW5le2JhY2tncm91bmQ6dmFyKC0tY3JpdGljYWwpfQouc3RhdHVzLWNoaXAgLm5hbWV7Zm9udC1zaXplOjAuNzVyZW07Zm9udC13ZWlnaHQ6NTAwO2NvbG9yOnZhcigtLXRleHRTZWNvbmRhcnkpfQoKLyogU2tlbGV0b24gY2hpcCBmb3IgbG9hZGluZyBzdGF0ZSAqLwouc3RhdHVzLWNoaXAuc2tlbGV0b24tY2hpcHtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWJvcmRlcik7b3BhY2l0eTowLjZ9Ci5zdGF0dXMtY2hpcC5za2VsZXRvbi1jaGlwIC5za2VsZXRvbntiYWNrZ3JvdW5kOnZhcigtLWJnSG92ZXIpfQoKLyogPT09PT0gTUFJTiBDT05URU5UID09PT09ICovCiNtYWlue3BhZGRpbmc6dmFyKC0tc3BhY2UteGwpIDB9CgovKiBLUEkgR3JpZCAqLwoua3BpLWdyaWR7CiAgZGlzcGxheTpncmlkOwogIGdyaWQtdGVtcGxhdGUtY29sdW1uczpyZXBlYXQoNCwxZnIpOwogIGdhcDp2YXIoLS1zcGFjZS1sZyk7CiAgbWFyZ2luLWJvdHRvbTp2YXIoLS1zcGFjZS14bCk7Cn0KQG1lZGlhKG1heC13aWR0aDoxMjgwcHgpey5rcGktZ3JpZHtncmlkLXRlbXBsYXRlLWNvbHVtbnM6cmVwZWF0KDIsMWZyKX19CkBtZWRpYShtYXgtd2lkdGg6NzY4cHgpey5rcGktZ3JpZHtncmlkLXRlbXBsYXRlLWNvbHVtbnM6MWZyfX0KCi5tZXRyaWMtdGlsZXsKICBiYWNrZ3JvdW5kOnZhcigtLWJnQ2FyZCk7CiAgYm9yZGVyOjFweCBzb2xpZCB2YXIoLS1ib3JkZXIpOwogIGJvcmRlci1yYWRpdXM6dmFyKC0tcmFkaXVzLWxnKTsKICBwYWRkaW5nOnZhcigtLXNwYWNlLWxnKTsKICBkaXNwbGF5OmZsZXg7ZmxleC1kaXJlY3Rpb246Y29sdW1uO2dhcDp2YXIoLS1zcGFjZS1zbSk7CiAgdHJhbnNpdGlvbjpib3JkZXItY29sb3IgMC4zczsKfQoubWV0cmljLXRpbGU6aG92ZXJ7Ym9yZGVyLWNvbG9yOnZhcigtLWJvcmRlckxpZ2h0KX0KLm1ldHJpYy10aWxlLmNyaXRpY2Fse2JvcmRlci1sZWZ0OjNweCBzb2xpZCB2YXIoLS1jcml0aWNhbCl9Ci5tZXRyaWMtdGlsZS53YXJuaW5ne2JvcmRlci1sZWZ0OjNweCBzb2xpZCB2YXIoLS13YXJuaW5nKX0KLm1ldHJpYy10aWxlIC50aWxlLWxhYmVse2NvbG9yOnZhcigtLXRleHRTZWNvbmRhcnkpfQoubWV0cmljLXRpbGUgLnRpbGUtdmFsdWV7Y29sb3I6dmFyKC0tdGV4dFByaW1hcnkpfQoubWV0cmljLXRpbGUgLnRpbGUtc3Vie2NvbG9yOnZhcigtLXRleHRNdXRlZCl9CgovKiBDaGFydHMgUm93ICovCi5jaGFydHMtcm93ewogIGRpc3BsYXk6Z3JpZDsKICBncmlkLXRlbXBsYXRlLWNvbHVtbnM6MmZyIDFmcjsKICBnYXA6dmFyKC0tc3BhY2UtbGcpOwogIG1hcmdpbi1ib3R0b206dmFyKC0tc3BhY2UteGwpOwp9CkBtZWRpYShtYXgtd2lkdGg6NzY4cHgpey5jaGFydHMtcm93e2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnJ9fQoKLmNoYXJ0LWNhcmR7CiAgYmFja2dyb3VuZDp2YXIoLS1iZ0NhcmQpOwogIGJvcmRlcjoxcHggc29saWQgdmFyKC0tYm9yZGVyKTsKICBib3JkZXItcmFkaXVzOnZhcigtLXJhZGl1cy1sZyk7CiAgcGFkZGluZzp2YXIoLS1zcGFjZS1sZyk7Cn0KLmNoYXJ0LWNhcmQgLmNoYXJ0LWhlYWRlcnttYXJnaW4tYm90dG9tOnZhcigtLXNwYWNlLW1kKX0KLmNoYXJ0LWNhcmQgLmNoYXJ0LWJvZHl7aGVpZ2h0OjMwMHB4fQoKLyogRGV0YWlsIFJvdyAqLwouZGV0YWlsLXJvd3sKICBkaXNwbGF5OmdyaWQ7CiAgZ3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjNmciAyZnI7CiAgZ2FwOnZhcigtLXNwYWNlLWxnKTsKICBtYXJnaW4tYm90dG9tOnZhcigtLXNwYWNlLXhsKTsKfQpAbWVkaWEobWF4LXdpZHRoOjc2OHB4KXsuZGV0YWlsLXJvd3tncmlkLXRlbXBsYXRlLWNvbHVtbnM6MWZyfX0KCi8qIFNlc3Npb25zICovCi5zZXNzaW9ucy1jYXJkewogIGJhY2tncm91bmQ6dmFyKC0tYmdDYXJkKTsKICBib3JkZXI6MXB4IHNvbGlkIHZhcigtLWJvcmRlcik7CiAgYm9yZGVyLXJhZGl1czp2YXIoLS1yYWRpdXMtbGcpOwp9Ci5zZXNzaW9ucy1jYXJkIC5jYXJkLWhlYWRlcnsKICBwYWRkaW5nOnZhcigtLXNwYWNlLWxnKTtib3JkZXItYm90dG9tOjFweCBzb2xpZCB2YXIoLS1ib3JkZXIpOwogIGRpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjthbGlnbi1pdGVtczpjZW50ZXI7Cn0KLnNlc3Npb24tcm93ewogIGRpc3BsYXk6Z3JpZDsKICBncmlkLXRlbXBsYXRlLWNvbHVtbnM6YXV0byAxZnIgYXV0byBhdXRvIGF1dG8gYXV0byBhdXRvOwogIGdhcDp2YXIoLS1zcGFjZS1tZCk7YWxpZ24taXRlbXM6Y2VudGVyOwogIHBhZGRpbmc6dmFyKC0tc3BhY2UtbWQpIHZhcigtLXNwYWNlLWxnKTsKICBib3JkZXItYm90dG9tOjFweCBzb2xpZCB2YXIoLS1ib3JkZXIpOwogIHRyYW5zaXRpb246YmFja2dyb3VuZCAwLjE1czsKfQouc2Vzc2lvbi1yb3c6aG92ZXJ7YmFja2dyb3VuZDp2YXIoLS1iZ0hvdmVyKX0KLnNlc3Npb24tcm93Omxhc3QtY2hpbGR7Ym9yZGVyLWJvdHRvbTpub25lfQpAbWVkaWEobWF4LXdpZHRoOjc2OHB4KXsKICAuc2Vzc2lvbi1yb3d7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOmF1dG8gMWZyIGF1dG87Z2FwOnZhcigtLXNwYWNlLXNtKX0KICAuc2Vzc2lvbi1yb3cgLmhpZGUtbW9iaWxle2Rpc3BsYXk6bm9uZX0KfQoKLyogQWxlcnRzICovCi5hbGVydHMtY2FyZHsKICBiYWNrZ3JvdW5kOnZhcigtLWJnQ2FyZCk7CiAgYm9yZGVyOjFweCBzb2xpZCB2YXIoLS1ib3JkZXIpOwogIGJvcmRlci1yYWRpdXM6dmFyKC0tcmFkaXVzLWxnKTsKfQouYWxlcnRzLWNhcmQgLmNhcmQtaGVhZGVyewogIHBhZGRpbmc6dmFyKC0tc3BhY2UtbGcpO2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHZhcigtLWJvcmRlcik7CiAgZGlzcGxheTpmbGV4O2p1c3RpZnktY29udGVudDpzcGFjZS1iZXR3ZWVuO2FsaWduLWl0ZW1zOmNlbnRlcjsKfQouYWxlcnQtcm93ewogIGRpc3BsYXk6ZmxleDtnYXA6dmFyKC0tc3BhY2UtbWQpOwogIHBhZGRpbmc6dmFyKC0tc3BhY2UtbWQpIHZhcigtLXNwYWNlLWxnKTsKICBib3JkZXItYm90dG9tOjFweCBzb2xpZCB2YXIoLS1ib3JkZXIpOwogIGJvcmRlci1sZWZ0OjRweCBzb2xpZCB0cmFuc3BhcmVudDsKfQouYWxlcnQtcm93LmNyaXRpY2Fse2JvcmRlci1sZWZ0LWNvbG9yOnZhcigtLWNyaXRpY2FsKX0KLmFsZXJ0LXJvdy53YXJuaW5ne2JvcmRlci1sZWZ0LWNvbG9yOnZhcigtLXdhcm5pbmcpfQouYWxlcnQtcm93Omxhc3QtY2hpbGR7Ym9yZGVyLWJvdHRvbTpub25lfQouYWxlcnQtcm93IC5hbGVydC1ib2R5e2ZsZXg6MTttaW4td2lkdGg6MH0KLmFsZXJ0LXJvdyAuYWxlcnQtdHN7Y29sb3I6dmFyKC0tdGV4dE11dGVkKTt3aGl0ZS1zcGFjZTpub3dyYXB9Ci5hbGVydC1yb3cgLmFjay1idG57CiAgYmFja2dyb3VuZDp0cmFuc3BhcmVudDtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWJvcmRlcik7CiAgY29sb3I6dmFyKC0tdGV4dFNlY29uZGFyeSk7Ym9yZGVyLXJhZGl1czp2YXIoLS1yYWRpdXMtbWQpOwogIHBhZGRpbmc6NHB4IDEwcHg7Y3Vyc29yOnBvaW50ZXI7Zm9udC1zaXplOjAuNzVyZW07CiAgd2hpdGUtc3BhY2U6bm93cmFwOwp9Ci5hbGVydC1yb3cgLmFjay1idG46aG92ZXJ7YmFja2dyb3VuZDp2YXIoLS1iZ0hvdmVyKTtjb2xvcjp2YXIoLS10ZXh0UHJpbWFyeSl9CgovKiBGb290ZXIgKi8KI2Zvb3RlcnsKICBiYWNrZ3JvdW5kOnZhcigtLWJnU3VyZmFjZSk7CiAgYm9yZGVyLXRvcDoxcHggc29saWQgdmFyKC0tYm9yZGVyKTsKICBwYWRkaW5nOnZhcigtLXNwYWNlLWxnKSAwOwp9Ci5mb290ZXItY2FyZHN7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczpyZXBlYXQoMywxZnIpO2dhcDp2YXIoLS1zcGFjZS1sZyl9CkBtZWRpYShtYXgtd2lkdGg6NzY4cHgpey5mb290ZXItY2FyZHN7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmcn19Ci5mb290ZXItY2FyZHtiYWNrZ3JvdW5kOnZhcigtLWJnQ2FyZCk7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1ib3JkZXIpO2JvcmRlci1yYWRpdXM6dmFyKC0tcmFkaXVzLWxnKTtwYWRkaW5nOnZhcigtLXNwYWNlLWxnKX0KLmZvb3Rlci1jYXJkIC5mYy1oZWFkZXJ7bWFyZ2luLWJvdHRvbTp2YXIoLS1zcGFjZS1zbSl9Ci5rZXktY2hpcHsKICBkaXNwbGF5OmlubGluZS1ibG9jaztwYWRkaW5nOjJweCA4cHg7bWFyZ2luOjJweDsKICBiYWNrZ3JvdW5kOnZhcigtLWJnSG92ZXIpO2JvcmRlci1yYWRpdXM6dmFyKC0tcmFkaXVzLXNtKTsKICBmb250LXNpemU6MC43cmVtO2ZvbnQtZmFtaWx5OidKZXRCcmFpbnMgTW9ubycsbW9ub3NwYWNlOwogIGNvbG9yOnZhcigtLXRleHRTZWNvbmRhcnkpOwp9Ci5iYWRnZXsKICBkaXNwbGF5OmlubGluZS1ibG9jaztwYWRkaW5nOjJweCA4cHg7Ym9yZGVyLXJhZGl1czp2YXIoLS1yYWRpdXMtZnVsbCk7CiAgZm9udC1zaXplOjAuN3JlbTtmb250LXdlaWdodDo1MDA7Cn0KLmJhZGdlLm9re2JhY2tncm91bmQ6IzA1MkUxNjtjb2xvcjp2YXIoLS1zdWNjZXNzKX0KLmJhZGdlLndhcm57YmFja2dyb3VuZDojNDIyMDA2O2NvbG9yOnZhcigtLXdhcm5pbmcpfQouYmFkZ2UuZXJye2JhY2tncm91bmQ6IzJFMDgxNTtjb2xvcjp2YXIoLS1jcml0aWNhbCl9CgovKiA9PT09PSBTVEFURVMgPT09PT0gKi8KLnN0YXRlLW1zZ3sKICBkaXNwbGF5OmZsZXg7ZmxleC1kaXJlY3Rpb246Y29sdW1uO2FsaWduLWl0ZW1zOmNlbnRlcjtqdXN0aWZ5LWNvbnRlbnQ6Y2VudGVyOwogIHBhZGRpbmc6dmFyKC0tc3BhY2UtM3hsKTt0ZXh0LWFsaWduOmNlbnRlcjtnYXA6dmFyKC0tc3BhY2UtbWQpOwogIG1pbi1oZWlnaHQ6MjAwcHg7Cn0KLnN0YXRlLW1zZyAuaWNvbntmb250LXNpemU6Mi41cmVtfQouc3RhdGUtbXNnIC50aXRsZXtjb2xvcjp2YXIoLS10ZXh0UHJpbWFyeSl9Ci5zdGF0ZS1tc2cgLmRlc2N7Y29sb3I6dmFyKC0tdGV4dFNlY29uZGFyeSl9CgovKiBTa2VsZXRvbiBsb2FkaW5nICovCkBrZXlmcmFtZXMgc2hpbW1lcnswJXtvcGFjaXR5OjAuM301MCV7b3BhY2l0eTowLjZ9MTAwJXtvcGFjaXR5OjAuM319Ci5za2VsZXRvbnsKICBiYWNrZ3JvdW5kOnZhcigtLWJnSG92ZXIpO2JvcmRlci1yYWRpdXM6dmFyKC0tcmFkaXVzLW1kKTsKICBhbmltYXRpb246c2hpbW1lciAxLjVzIGluZmluaXRlOwp9Ci5za2VsZXRvbi10ZXh0e2hlaWdodDoxcmVtO3dpZHRoOjYwJTttYXJnaW4tYm90dG9tOnZhcigtLXNwYWNlLXNtKX0KLnNrZWxldG9uLXZhbHVle2hlaWdodDoyLjI1cmVtO3dpZHRoOjQwJX0KCi8qIFB1bHNlIGFuaW1hdGlvbiBmb3Igc3RhdHVzIGRvdHMgKi8KQGtleWZyYW1lcyBwdWxzZXsKICAwJSwxMDAle29wYWNpdHk6MX0KICA1MCV7b3BhY2l0eTowLjR9Cn0KCi8qIERvd25sb2FkIGJ1dHRvbiAqLwouZG93bmxvYWQtYnRuewogIGJhY2tncm91bmQ6dmFyKC0tcHJpbWFyeSk7CiAgY29sb3I6dmFyKC0tdGV4dE9uUHJpbWFyeSk7CiAgYm9yZGVyOm5vbmU7Ym9yZGVyLXJhZGl1czp2YXIoLS1yYWRpdXMtbWQpOwogIHBhZGRpbmc6NnB4IDE0cHg7Y3Vyc29yOnBvaW50ZXI7CiAgZm9udC1mYW1pbHk6J0ludGVyJyxzYW5zLXNlcmlmO2ZvbnQtc2l6ZTowLjhyZW07Zm9udC13ZWlnaHQ6NjAwOwogIHRyYW5zaXRpb246YmFja2dyb3VuZCAwLjJzOwp9Ci5kb3dubG9hZC1idG46aG92ZXJ7YmFja2dyb3VuZDojN0REM0ZDfQoKLyogVG9hc3Qgbm90aWZpY2F0aW9uICovCi50b2FzdC1jb250YWluZXJ7cG9zaXRpb246Zml4ZWQ7dG9wOnZhcigtLXNwYWNlLWxnKTtyaWdodDp2YXIoLS1zcGFjZS1sZyk7ei1pbmRleDoyMDA7ZGlzcGxheTpmbGV4O2ZsZXgtZGlyZWN0aW9uOmNvbHVtbjtnYXA6dmFyKC0tc3BhY2Utc20pfQoudG9hc3R7CiAgYmFja2dyb3VuZDp2YXIoLS1iZ0NhcmQpO2JvcmRlcjoxcHggc29saWQgdmFyKC0tYm9yZGVyKTsKICBib3JkZXItcmFkaXVzOnZhcigtLXJhZGl1cy1tZCk7cGFkZGluZzp2YXIoLS1zcGFjZS1tZCkgdmFyKC0tc3BhY2UtbGcpOwogIG1heC13aWR0aDozNjBweDthbmltYXRpb246c2xpZGVJbiAwLjNzIGVhc2U7Cn0KLnRvYXN0LmNyaXRpY2Fse2JvcmRlci1sZWZ0OjNweCBzb2xpZCB2YXIoLS1jcml0aWNhbCl9Ci50b2FzdC53YXJuaW5ne2JvcmRlci1sZWZ0OjNweCBzb2xpZCB2YXIoLS13YXJuaW5nKX0KQGtleWZyYW1lcyBzbGlkZUlue2Zyb217dHJhbnNmb3JtOnRyYW5zbGF0ZVgoMTAwJSk7b3BhY2l0eTowfXRve3RyYW5zZm9ybTp0cmFuc2xhdGVYKDApO29wYWNpdHk6MX19Cjwvc3R5bGU+CjwvaGVhZD4KPGJvZHk+Cgo8IS0tID09PT09IFRPUCBCQVIgPT09PT0gLS0+CjxkaXYgaWQ9InRvcGJhciI+CiAgPGRpdiBjbGFzcz0iY29udGFpbmVyIj4KICAgIDxkaXYgY2xhc3M9InRvcGJhci1sZWZ0Ij4KICAgICAgPGRpdiBjbGFzcz0idG9wYmFyLWxvZ28iIGlkPSJ0b3BiYXItZG90Ij48L2Rpdj4KICAgICAgPHNwYW4gY2xhc3M9ImhlYWRpbmctbWQiPkhlcm1lcyBNb25pdG9yPC9zcGFuPgogICAgPC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJ0b3BiYXItcmlnaHQiPgogICAgICA8ZGl2IGNsYXNzPSJyZWZyZXNoLWluZGljYXRvciI+PGRpdiBjbGFzcz0iZG90Ij48L2Rpdj48c3BhbiBjbGFzcz0ibW9uby1zbSIgaWQ9Imxhc3QtcmVmcmVzaCI+LS08L3NwYW4+PC9kaXY+CiAgICAgIDxzcGFuIGlkPSJjbG9jayIgY2xhc3M9Im1vbm8tc20iPi0tOi0tOi0tPC9zcGFuPgogICAgPC9kaXY+CiAgPC9kaXY+CjwvZGl2PgoKPCEtLSA9PT09PSBTVEFUVVMgU1RSSVAgPT09PT0gLS0+CjxkaXYgaWQ9InN0YXR1cy1zdHJpcCI+PGRpdiBjbGFzcz0iY29udGFpbmVyIiBpZD0ic3RhdHVzLXN0cmlwLWlubmVyIj48L2Rpdj48L2Rpdj4KCjwhLS0gPT09PT0gTUFJTiBDT05URU5UID09PT09IC0tPgo8ZGl2IGNsYXNzPSJjb250YWluZXIiIGlkPSJtYWluIj4KCiAgPCEtLSBLUEkgR3JpZCAtLT4KICA8ZGl2IGNsYXNzPSJrcGktZ3JpZCIgaWQ9ImtwaS1ncmlkIj48L2Rpdj4KCiAgPCEtLSBDaGFydHMgUm93IC0tPgogIDxkaXYgY2xhc3M9ImNoYXJ0cy1yb3ciPgogICAgPGRpdiBjbGFzcz0iY2hhcnQtY2FyZCI+CiAgICAgIDxkaXYgY2xhc3M9ImNoYXJ0LWhlYWRlciBoZWFkaW5nLW1kIj5XeWtvcnp5c3RhbmllIHRva2Vuw7N3IC8ga29zenTDs3c8L2Rpdj4KICAgICAgPGRpdiBjbGFzcz0iY2hhcnQtYm9keSIgaWQ9ImNoYXJ0LXVzYWdlIj48L2Rpdj4KICAgIDwvZGl2PgogICAgPGRpdiBjbGFzcz0iY2hhcnQtY2FyZCI+CiAgICAgIDxkaXYgY2xhc3M9ImNoYXJ0LWhlYWRlciBoZWFkaW5nLW1kIj5Ub3AgbW9kZWxlPC9kaXY+CiAgICAgIDxkaXYgY2xhc3M9ImNoYXJ0LWJvZHkiIGlkPSJjaGFydC1tb2RlbHMiPjwvZGl2PgogICAgPC9kaXY+CiAgPC9kaXY+CgogIDwhLS0gRGV0YWlsIFJvdyAtLT4KICA8ZGl2IGNsYXNzPSJkZXRhaWwtcm93Ij4KICAgIDxkaXYgY2xhc3M9InNlc3Npb25zLWNhcmQiPgogICAgICA8ZGl2IGNsYXNzPSJjYXJkLWhlYWRlciI+PHNwYW4gY2xhc3M9ImhlYWRpbmctbWQiPk9zdGF0bmllIHNlc2plPC9zcGFuPjxzcGFuIGNsYXNzPSJib2R5LXNtIiBzdHlsZT0iY29sb3I6dmFyKC0tdGV4dE11dGVkKSIgaWQ9InNlc3Npb24tY291bnQiPi0tPC9zcGFuPjwvZGl2PgogICAgICA8ZGl2IGlkPSJzZXNzaW9ucy1saXN0Ij48L2Rpdj4KICAgIDwvZGl2PgogICAgPGRpdiBjbGFzcz0iYWxlcnRzLWNhcmQiPgogICAgICA8ZGl2IGNsYXNzPSJjYXJkLWhlYWRlciI+PHNwYW4gY2xhc3M9ImhlYWRpbmctbWQiPkFsZXJ0eTwvc3Bhbj48c3BhbiBjbGFzcz0iYmFkZ2UgZXJyIiBpZD0iYWxlcnQtY291bnQiIHN0eWxlPSJkaXNwbGF5Om5vbmUiPjA8L3NwYW4+PC9kaXY+CiAgICAgIDxkaXYgaWQ9ImFsZXJ0cy1saXN0Ij48L2Rpdj4KICAgIDwvZGl2PgogIDwvZGl2PgoKICA8IS0tIEZvb3RlciAtLT4KICA8ZGl2IGlkPSJmb290ZXItc2VjdGlvbiI+CiAgICA8ZGl2IGNsYXNzPSJmb290ZXItY2FyZHMiPgogICAgICA8ZGl2IGNsYXNzPSJmb290ZXItY2FyZCI+CiAgICAgICAgPGRpdiBjbGFzcz0iZmMtaGVhZGVyIGxhYmVsLW1kIiBzdHlsZT0iY29sb3I6dmFyKC0tdGV4dFNlY29uZGFyeSkiPktsdWN6ZSBBUEk8L2Rpdj4KICAgICAgICA8ZGl2IGlkPSJmb290ZXIta2V5cyI+PC9kaXY+CiAgICAgIDwvZGl2PgogICAgICA8ZGl2IGNsYXNzPSJmb290ZXItY2FyZCI+CiAgICAgICAgPGRpdiBjbGFzcz0iZmMtaGVhZGVyIGxhYmVsLW1kIiBzdHlsZT0iY29sb3I6dmFyKC0tdGV4dFNlY29uZGFyeSkiPkthbmJhbjwvZGl2PgogICAgICAgIDxkaXYgaWQ9ImZvb3Rlci1rYW5iYW4iPjwvZGl2PgogICAgICA8L2Rpdj4KICAgICAgPGRpdiBjbGFzcz0iZm9vdGVyLWNhcmQiPgogICAgICAgIDxkaXYgY2xhc3M9ImZjLWhlYWRlciBsYWJlbC1tZCIgc3R5bGU9ImNvbG9yOnZhcigtLXRleHRTZWNvbmRhcnkpIj5TeXN0ZW08L2Rpdj4KICAgICAgICA8ZGl2IGlkPSJmb290ZXItc3lzdGVtIj48L2Rpdj4KICAgICAgPC9kaXY+CiAgICA8L2Rpdj4KICA8L2Rpdj4KCjwvZGl2PgoKPCEtLSBUb2FzdCBjb250YWluZXIgLS0+CjxkaXYgY2xhc3M9InRvYXN0LWNvbnRhaW5lciIgaWQ9InRvYXN0cyI+PC9kaXY+Cgo8c2NyaXB0PgovLyA9PT09PSBDT05GSUcgPT09PT0KY29uc3QgQVBJX0JBU0UgPSAnJzsKY29uc3QgUkVGUkVTSF9JTlRFUlZBTCA9IDEwMDAwOyAvLyAxMHMKY29uc3QgREVGQVVMVF9QUk9GSUxFID0gJ3Byb2dyYW1pc3RhJzsKCmxldCB1c2FnZUNoYXJ0ID0gbnVsbDsKbGV0IG1vZGVsc0NoYXJ0ID0gbnVsbDsKbGV0IHJlZnJlc2hUaW1lciA9IG51bGw7CgovLyA9PT09PSBIRUxQRVJTID09PT09CmZ1bmN0aW9uIGZvcm1hdE51bWJlcihuKSB7CiAgaWYgKG4gPT0gbnVsbCkgcmV0dXJuICctLSc7CiAgaWYgKG4gPj0gMV8wMDBfMDAwKSByZXR1cm4gKG4gLyAxXzAwMF8wMDApLnRvRml4ZWQoMSkgKyAnTSc7CiAgaWYgKG4gPj0gMV8wMDApIHJldHVybiAobiAvIDFfMDAwKS50b0ZpeGVkKDEpICsgJ2snOwogIHJldHVybiBuLnRvTG9jYWxlU3RyaW5nKCdwbC1QTCcpOwp9CgpmdW5jdGlvbiBmb3JtYXRDb3N0KHVzZCkgewogIGlmICh1c2QgPT0gbnVsbCkgcmV0dXJuICctLSc7CiAgcmV0dXJuICckJyArIHVzZC50b0ZpeGVkKDIpOwp9CgpmdW5jdGlvbiBmb3JtYXREdXJhdGlvbihzZWNvbmRzKSB7CiAgaWYgKHNlY29uZHMgPT0gbnVsbCkgcmV0dXJuICctLSc7CiAgaWYgKHNlY29uZHMgPCA2MCkgcmV0dXJuIE1hdGgucm91bmQoc2Vjb25kcykgKyAncyc7CiAgaWYgKHNlY29uZHMgPCAzNjAwKSByZXR1cm4gTWF0aC5yb3VuZChzZWNvbmRzIC8gNjApICsgJ20nOwogIHJldHVybiAoc2Vjb25kcyAvIDM2MDApLnRvRml4ZWQoMSkgKyAnaCc7Cn0KCmZ1bmN0aW9uIHRpbWVBZ28oaXNvU3RyKSB7CiAgaWYgKCFpc29TdHIpIHJldHVybiAnLS0nOwogIGNvbnN0IG1zID0gRGF0ZS5ub3coKSAtIG5ldyBEYXRlKGlzb1N0cikuZ2V0VGltZSgpOwogIHJldHVybiBmb3JtYXREdXJhdGlvbihtcyAvIDEwMDApICsgJyB0ZW11JzsKfQoKZnVuY3Rpb24gZXNjYXBlSHRtbChzKSB7CiAgaWYgKCFzKSByZXR1cm4gJyc7CiAgY29uc3QgZCA9IGRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoJ2RpdicpOwogIGQudGV4dENvbnRlbnQgPSBzOwogIHJldHVybiBkLmlubmVySFRNTDsKfQoKLy8gPT09PT0gQ0xPQ0sgPT09PT0KZnVuY3Rpb24gdXBkYXRlQ2xvY2soKSB7CiAgY29uc3Qgbm93ID0gbmV3IERhdGUoKTsKICBjb25zdCBjZXQgPSBuZXcgRGF0ZShub3cudG9Mb2NhbGVTdHJpbmcoJ2VuLVVTJywge3RpbWVab25lOidFdXJvcGUvV2Fyc2F3J30pKTsKICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnY2xvY2snKS50ZXh0Q29udGVudCA9CiAgICBjZXQudG9Mb2NhbGVUaW1lU3RyaW5nKCdwbC1QTCcsIHtob3VyOicyLWRpZ2l0JyxtaW51dGU6JzItZGlnaXQnLHNlY29uZDonMi1kaWdpdCd9KSArICcgQ0VUJzsKfQpzZXRJbnRlcnZhbCh1cGRhdGVDbG9jaywgMTAwMCk7CnVwZGF0ZUNsb2NrKCk7CgovLyA9PT09PSBUT0FTVFMgPT09PT0KZnVuY3Rpb24gc2hvd1RvYXN0KG1zZywgbGV2ZWwpIHsKICBjb25zdCBjb250YWluZXIgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndG9hc3RzJyk7CiAgY29uc3QgZWwgPSBkb2N1bWVudC5jcmVhdGVFbGVtZW50KCdkaXYnKTsKICBlbC5jbGFzc05hbWUgPSAndG9hc3QgJyArIChsZXZlbHx8JycpOwogIGVsLnRleHRDb250ZW50ID0gbXNnOwogIGNvbnRhaW5lci5hcHBlbmRDaGlsZChlbCk7CiAgc2V0VGltZW91dCgoKSA9PiBlbC5yZW1vdmUoKSwgNTAwMCk7Cn0KCi8vID09PT09IEZFVENIIFdJVEggRVJST1IgSEFORExJTkcgPT09PT0KYXN5bmMgZnVuY3Rpb24gYXBpRmV0Y2gocGF0aCkgewogIHRyeSB7CiAgICBjb25zdCByZXNwID0gYXdhaXQgZmV0Y2goQVBJX0JBU0UgKyBwYXRoKTsKICAgIGlmICghcmVzcC5vaykgdGhyb3cgbmV3IEVycm9yKGBIVFRQICR7cmVzcC5zdGF0dXN9YCk7CiAgICByZXR1cm4gYXdhaXQgcmVzcC5qc29uKCk7CiAgfSBjYXRjaChlKSB7CiAgICByZXR1cm4ge19lcnJvcjogZS5tZXNzYWdlfTsKICB9Cn0KCi8vID09PT09IFJFTkRFUjogU1RBVFVTIFNUUklQID09PT09CmZ1bmN0aW9uIHJlbmRlclN0YXR1c1N0cmlwKHN0YXR1c0RhdGEpIHsKICBjb25zdCBlbCA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdzdGF0dXMtc3RyaXAtaW5uZXInKTsKICBpZiAoIXN0YXR1c0RhdGEgfHwgc3RhdHVzRGF0YS5fZXJyb3IgfHwgIXN0YXR1c0RhdGEucHJvZmlsZXMpIHsKICAgIGVsLmlubmVySFRNTCA9ICc8ZGl2IGNsYXNzPSJzdGF0ZS1tc2ciPjxkaXYgY2xhc3M9ImJvZHktc20iIHN0eWxlPSJjb2xvcjp2YXIoLS10ZXh0TXV0ZWQpIj5CcmFrIGRhbnljaCBvIHN0YXR1c2llPC9kaXY+PC9kaXY+JzsKICAgIHJldHVybjsKICB9CgogIC8vIFVwZGF0ZSB0b3BiYXIgZG90CiAgY29uc3QgYWxsUnVubmluZyA9IHN0YXR1c0RhdGEuc3VtbWFyeT8ucHJvZmlsZXNfdG90YWwgPT09IHN0YXR1c0RhdGEuc3VtbWFyeT8ucHJvZmlsZXNfcnVubmluZzsKICBjb25zdCBkb3QgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndG9wYmFyLWRvdCcpOwogIGRvdC5zdHlsZS5iYWNrZ3JvdW5kID0gYWxsUnVubmluZyA/ICd2YXIoLS1zdWNjZXNzKScgOiAndmFyKC0td2FybmluZyknOwoKICBlbC5pbm5lckhUTUwgPSBzdGF0dXNEYXRhLnByb2ZpbGVzLm1hcChwID0+IHsKICAgIGNvbnN0IGd3UnVubmluZyA9IHAuZ2F0ZXdheT8ucnVubmluZzsKICAgIGNvbnN0IHN0YXRlID0gZ3dSdW5uaW5nID8gJ29ubGluZScgOiAnb2ZmbGluZSc7CiAgICBjb25zdCBuYW1lID0gcC5wcm9maWxlOwogICAgcmV0dXJuIGA8ZGl2IGNsYXNzPSJzdGF0dXMtY2hpcCI+CiAgICAgIDxkaXYgY2xhc3M9ImRvdCAke3N0YXRlfSIke2d3UnVubmluZyA/ICcgc3R5bGU9ImFuaW1hdGlvbjpwdWxzZSAycyBpbmZpbml0ZSInIDogJyd9PjwvZGl2PgogICAgICA8c3BhbiBjbGFzcz0ibmFtZSI+JHtlc2NhcGVIdG1sKG5hbWUpfTwvc3Bhbj4KICAgICAgJHtwLmdhdGV3YXk/LmFjdGl2ZV9hZ2VudHMgPiAwID8gYDxzcGFuIGNsYXNzPSJtb25vLXNtIiBzdHlsZT0iY29sb3I6dmFyKC0tcHJpbWFyeSkiPiR7cC5nYXRld2F5LmFjdGl2ZV9hZ2VudHN9IGFnZW50PC9zcGFuPmAgOiAnJ30KICAgIDwvZGl2PmA7CiAgfSkuam9pbignJykgfHwgJzxzcGFuIGNsYXNzPSJib2R5LXNtIiBzdHlsZT0iY29sb3I6dmFyKC0tdGV4dE11dGVkKTtwYWRkaW5nOjAgdmFyKC0tc3BhY2Utc20pIj5CcmFrIHByb2ZpbGk8L3NwYW4+JzsKfQoKLy8gPT09PT0gUkVOREVSOiBLUEkgR1JJRCA9PT09PQpmdW5jdGlvbiByZW5kZXJLcGlHcmlkKHN0YXR1c0RhdGEsIHVzYWdlRGF0YSwgc2Vzc2lvbnNEYXRhLCBrYW5iYW5EYXRhLCBhbGVydHNEYXRhLCBrZXlzRGF0YSkgewogIGNvbnN0IGVsID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2twaS1ncmlkJyk7CiAgaWYgKHN0YXR1c0RhdGE/Ll9lcnJvciAmJiB1c2FnZURhdGE/Ll9lcnJvcikgewogICAgZWwuaW5uZXJIVE1MID0gJzxkaXYgY2xhc3M9InN0YXRlLW1zZyI+PGRpdiBjbGFzcz0iaWNvbiI+4pqg77iPPC9kaXY+PGRpdiBjbGFzcz0idGl0bGUgaGVhZGluZy1tZCI+TmllIG1vxbxuYSB6YcWCYWRvd2HEhyBtZXRyeWs8L2Rpdj48ZGl2IGNsYXNzPSJkZXNjIGJvZHktc20iPkJhY2tlbmQgbmllIG9kcG93aWFkYTwvZGl2PjwvZGl2Pic7CiAgICByZXR1cm47CiAgfQoKICBjb25zdCBzdW1tYXJ5ID0gc3RhdHVzRGF0YT8uc3VtbWFyeSB8fCB7fTsKICBjb25zdCBzZXNzaW9ucyA9IHNlc3Npb25zRGF0YT8uc2Vzc2lvbnMgfHwgW107CiAgY29uc3QgdXNhZ2UgPSB1c2FnZURhdGE/LmRhaWx5IHx8IFtdOwogIGNvbnN0IHRvZGF5VXNhZ2UgPSB1c2FnZS5sZW5ndGggPiAwID8gdXNhZ2VbMF0gOiBudWxsOwoKICAvLyBDb3VudCBhY3RpdmUgYWdlbnRzIGFjcm9zcyBhbGwgcHJvZmlsZXMKICBsZXQgYWN0aXZlQWdlbnRzID0gMDsKICAoc3RhdHVzRGF0YT8ucHJvZmlsZXMgfHwgW10pLmZvckVhY2gocCA9PiB7CiAgICBhY3RpdmVBZ2VudHMgKz0gcC5nYXRld2F5Py5hY3RpdmVfYWdlbnRzIHx8IDA7CiAgfSk7CgogIGNvbnN0IHRpbGVzID0gWwogICAgewogICAgICBsYWJlbDogJ1Byb2ZpbGUgb25saW5lJywKICAgICAgdmFsdWU6IGAke3N1bW1hcnkucHJvZmlsZXNfcnVubmluZyB8fCAwfS8ke3N1bW1hcnkucHJvZmlsZXNfdG90YWwgfHwgMH1gLAogICAgICBzdWI6IHN1bW1hcnkucHJvZmlsZXNfcnVubmluZyA9PT0gc3VtbWFyeS5wcm9maWxlc190b3RhbCA/ICdXc3p5c3RraWUgT0snIDogJ05pZWt0w7NyZSBvZmZsaW5lJywKICAgICAgY2xzOiAnJwogICAgfSwKICAgIHsKICAgICAgbGFiZWw6ICdBa3R5d25lIGFnZW50eScsCiAgICAgIHZhbHVlOiBhY3RpdmVBZ2VudHMsCiAgICAgIHN1YjogJ3N1YnByb2Nlc3N5IGdhdGV3YXknLAogICAgICBjbHM6ICcnCiAgICB9LAogICAgewogICAgICBsYWJlbDogJ1Rva2VueSBkemnFmycsCiAgICAgIHZhbHVlOiBmb3JtYXROdW1iZXIodG9kYXlVc2FnZT8udG9rZW5zPy5pbnB1dCB8fCAwKSwKICAgICAgc3ViOiBgaW5wdXQgwrcgJHtzZXNzaW9ucy5sZW5ndGh9IHNlc2ppYCwKICAgICAgY2xzOiAnJwogICAgfSwKICAgIHsKICAgICAgbGFiZWw6ICdLb3N6dCBkemnFmyAoZXN0LiknLAogICAgICB2YWx1ZTogZm9ybWF0Q29zdCh0b2RheVVzYWdlPy5jb3N0Py5lc3RpbWF0ZWRfdXNkIHx8IDApLAogICAgICBzdWI6IGAke3VzYWdlRGF0YT8uYnlfbW9kZWw/Lmxlbmd0aCB8fCAwfSBtb2RlbGVgLAogICAgICBjbHM6ICcnCiAgICB9LAogICAgewogICAgICBsYWJlbDogJ0LFgsSZZHkgKDFoKScsCiAgICAgIHZhbHVlOiBzdW1tYXJ5LmVycm9yc18xaCB8fCAwLAogICAgICBzdWI6IHN1bW1hcnkuZXJyb3JzXzFoID4gMCA/ICdXeW1hZ2EgdXdhZ2knIDogJ0N6eXN0bycsCiAgICAgIGNsczogc3VtbWFyeS5lcnJvcnNfMWggPiAwID8gJ2NyaXRpY2FsJyA6ICcnCiAgICB9LAogICAgewogICAgICBsYWJlbDogJ0FsZXJ0eSBha3R5d25lJywKICAgICAgdmFsdWU6IChhbGVydHNEYXRhPy5hbGVydHMgfHwgW10pLmxlbmd0aCwKICAgICAgc3ViOiBhbGVydHNEYXRhPy5hbGVydHM/Lmxlbmd0aCA+IDAgPyAnTmllemFha2NlcHRvd2FuZScgOiAnQnJhayBhbGVydMOzdycsCiAgICAgIGNsczogYWxlcnRzRGF0YT8uYWxlcnRzPy5sZW5ndGggPiAwID8gJ2NyaXRpY2FsJyA6ICcnCiAgICB9LAogICAgewogICAgICBsYWJlbDogJ0thbmJhbiB0YXNraScsCiAgICAgIHZhbHVlOiBmb3JtYXROdW1iZXIoT2JqZWN0LnZhbHVlcyhrYW5iYW5EYXRhPy50YXNrc19ieV9zdGF0dXMgfHwge30pLnJlZHVjZSgoYSxiKT0+YStiLDApKSwKICAgICAgc3ViOiBgZG9uZToke2thbmJhbkRhdGE/LnRhc2tzX2J5X3N0YXR1cz8uZG9uZXx8MH0gcnVuOiR7a2FuYmFuRGF0YT8udGFza3NfYnlfc3RhdHVzPy5ydW5uaW5nfHwwfSB0b2RvOiR7a2FuYmFuRGF0YT8udGFza3NfYnlfc3RhdHVzPy50b2RvfHwwfWAsCiAgICAgIGNsczogJycKICAgIH0sCiAgICB7CiAgICAgIGxhYmVsOiAnS2x1Y3plIEFQSScsCiAgICAgIHZhbHVlOiAoa2V5c0RhdGE/LmFwaV9rZXlzX3NldCB8fCBbXSkubGVuZ3RoLAogICAgICBzdWI6IChrZXlzRGF0YT8uYXBpX2tleXNfc2V0IHx8IFtdKS5sZW5ndGggPiAwIAogICAgICAgID8gJ1Nrb25maWd1cm93YW55Y2gga2x1Y3p5JyAKICAgICAgICA6ICdCcmFrIHNrb25maWd1cm93YW55Y2gga2x1Y3p5JywKICAgICAgY2xzOiAoa2V5c0RhdGE/LmFwaV9rZXlzX3NldCB8fCBbXSkubGVuZ3RoID09PSAwID8gJ3dhcm5pbmcnIDogJycKICAgIH0KICBdOwoKICBlbC5pbm5lckhUTUwgPSB0aWxlcy5tYXAodCA9PiBgCiAgICA8ZGl2IGNsYXNzPSJtZXRyaWMtdGlsZSAke3QuY2xzfSI+CiAgICAgIDxkaXYgY2xhc3M9InRpbGUtbGFiZWwgYm9keS1zbSI+JHt0LmxhYmVsfTwvZGl2PgogICAgICA8ZGl2IGNsYXNzPSJ0aWxlLXZhbHVlIG1ldHJpYy14bCI+JHt0LnZhbHVlfTwvZGl2PgogICAgICA8ZGl2IGNsYXNzPSJ0aWxlLXN1YiBib2R5LXNtIj4ke3Quc3VifTwvZGl2PgogICAgPC9kaXY+CiAgYCkuam9pbignJyk7Cn0KCi8vID09PT09IFJFTkRFUjogVVNBR0UgQ0hBUlQgPT09PT0KZnVuY3Rpb24gcmVuZGVyVXNhZ2VDaGFydCh1c2FnZURhdGEpIHsKICBjb25zdCBkb20gPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnY2hhcnQtdXNhZ2UnKTsKICBpZiAoIXVzYWdlRGF0YSB8fCB1c2FnZURhdGEuX2Vycm9yIHx8ICF1c2FnZURhdGEuZGFpbHk/Lmxlbmd0aCkgewogICAgaWYgKHVzYWdlQ2hhcnQpIHsgdXNhZ2VDaGFydC5kaXNwb3NlKCk7IHVzYWdlQ2hhcnQgPSBudWxsOyB9CiAgICBkb20uaW5uZXJIVE1MID0gJzxkaXYgY2xhc3M9InN0YXRlLW1zZyIgc3R5bGU9Im1pbi1oZWlnaHQ6MjAwcHgiPjxkaXYgY2xhc3M9ImRlc2MgYm9keS1zbSIgc3R5bGU9ImNvbG9yOnZhcigtLXRleHRNdXRlZCkiPkJyYWsgZGFueWNoIG8genXFvHljaXU8L2Rpdj48L2Rpdj4nOwogICAgcmV0dXJuOwogIH0KCiAgLy8gT25seSBpbml0IG9uY2U7IHJlc2l6ZSB0byBmaXggYW55IGNvbnRhaW5lciBjaGFuZ2VzCiAgaWYgKCF1c2FnZUNoYXJ0KSB7CiAgICBkb20uaW5uZXJIVE1MID0gJyc7CiAgICB1c2FnZUNoYXJ0ID0gZWNoYXJ0cy5pbml0KGRvbSwgbnVsbCwge3JlbmRlcmVyOidjYW52YXMnfSk7CiAgfSBlbHNlIHsKICAgIHVzYWdlQ2hhcnQucmVzaXplKCk7CiAgfQoKICBjb25zdCBkYXlzID0gdXNhZ2VEYXRhLmRhaWx5LnNsaWNlKCkucmV2ZXJzZSgpOwogIGNvbnN0IGRhdGVzID0gZGF5cy5tYXAoZCA9PiBkLmRheS5zbGljZSg1KSk7IC8vIE1NLURECiAgY29uc3QgaW5wdXRzID0gZGF5cy5tYXAoZCA9PiBkLnRva2Vucz8uaW5wdXQgfHwgMCk7CiAgY29uc3Qgb3V0cHV0cyA9IGRheXMubWFwKGQgPT4gZC50b2tlbnM/Lm91dHB1dCB8fCAwKTsKICBjb25zdCBjb3N0cyA9IGRheXMubWFwKGQgPT4gZC5jb3N0Py5lc3RpbWF0ZWRfdXNkIHx8IDApOwoKICB1c2FnZUNoYXJ0LnNldE9wdGlvbih7CiAgICBkYXJrTW9kZTogdHJ1ZSwKICAgIGJhY2tncm91bmRDb2xvcjogJ3RyYW5zcGFyZW50JywKICAgIHRvb2x0aXA6IHt0cmlnZ2VyOidheGlzJ30sCiAgICBsZWdlbmQ6IHtkYXRhOlsnSW5wdXQgdG9rZW5zJywnT3V0cHV0IHRva2VucycsJ0tvc3p0ICgkKSddLHRleHRTdHlsZTp7Y29sb3I6JyM5NEEzQjgnfSxib3R0b206MH0sCiAgICBncmlkOiB7bGVmdDoxMiwgcmlnaHQ6MTIsIHRvcDoxMiwgYm90dG9tOjMyfSwKICAgIHhBeGlzOiB7dHlwZTonY2F0ZWdvcnknLGRhdGE6ZGF0ZXMsYXhpc0xpbmU6e2xpbmVTdHlsZTp7Y29sb3I6JyMxRTMzNEYnfX0sYXhpc0xhYmVsOntjb2xvcjonIzY0NzQ4QicsZm9udFNpemU6MTB9fSwKICAgIHlBeGlzOiBbCiAgICAgIHt0eXBlOid2YWx1ZScsYXhpc0xhYmVsOntjb2xvcjonIzY0NzQ4QicsZm9udFNpemU6MTAsZm9ybWF0dGVyOnY9PmZvcm1hdE51bWJlcih2KX0sc3BsaXRMaW5lOntsaW5lU3R5bGU6e2NvbG9yOicjMUUzMzRGJ319fSwKICAgICAge3R5cGU6J3ZhbHVlJyxheGlzTGFiZWw6e2NvbG9yOicjNjQ3NDhCJyxmb250U2l6ZToxMCxmb3JtYXR0ZXI6dj0+JyQnK3YudG9GaXhlZCgyKX0sc3BsaXRMaW5lOntzaG93OmZhbHNlfX0KICAgIF0sCiAgICBzZXJpZXM6IFsKICAgICAge25hbWU6J0lucHV0IHRva2VucycsdHlwZTonYmFyJyxkYXRhOmlucHV0cyxpdGVtU3R5bGU6e2NvbG9yOicjMzhCREY4J30sYmFyTWF4V2lkdGg6MjB9LAogICAgICB7bmFtZTonT3V0cHV0IHRva2VucycsdHlwZTonYmFyJyxkYXRhOm91dHB1dHMsaXRlbVN0eWxlOntjb2xvcjonIzgxOENGOCd9LGJhck1heFdpZHRoOjIwfSwKICAgICAge25hbWU6J0tvc3p0ICgkKScsdHlwZTonbGluZScseUF4aXNJbmRleDoxLGRhdGE6Y29zdHMsbGluZVN0eWxlOntjb2xvcjonI0Y1OUUwQicsd2lkdGg6Mn0sc3ltYm9sOidjaXJjbGUnLHN5bWJvbFNpemU6NixpdGVtU3R5bGU6e2NvbG9yOicjRjU5RTBCJ319CiAgICBdCiAgfSk7Cn0KCi8vID09PT09IFJFTkRFUjogTU9ERUxTIENIQVJUID09PT09CmZ1bmN0aW9uIHJlbmRlck1vZGVsc0NoYXJ0KHVzYWdlRGF0YSkgewogIGNvbnN0IGRvbSA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdjaGFydC1tb2RlbHMnKTsKICBpZiAoIXVzYWdlRGF0YSB8fCB1c2FnZURhdGEuX2Vycm9yIHx8ICF1c2FnZURhdGEuYnlfbW9kZWw/Lmxlbmd0aCkgewogICAgaWYgKG1vZGVsc0NoYXJ0KSB7IG1vZGVsc0NoYXJ0LmRpc3Bvc2UoKTsgbW9kZWxzQ2hhcnQgPSBudWxsOyB9CiAgICBkb20uaW5uZXJIVE1MID0gJzxkaXYgY2xhc3M9InN0YXRlLW1zZyIgc3R5bGU9Im1pbi1oZWlnaHQ6MjAwcHgiPjxkaXYgY2xhc3M9ImRlc2MgYm9keS1zbSIgc3R5bGU9ImNvbG9yOnZhcigtLXRleHRNdXRlZCkiPkJyYWsgZGFueWNoIG8gbW9kZWxhY2g8L2Rpdj48L2Rpdj4nOwogICAgcmV0dXJuOwogIH0KCiAgLy8gT25seSBpbml0IG9uY2U7IHJlc2l6ZSB0byBmaXggYW55IGNvbnRhaW5lciBjaGFuZ2VzCiAgaWYgKCFtb2RlbHNDaGFydCkgewogICAgZG9tLmlubmVySFRNTCA9ICcnOwogICAgbW9kZWxzQ2hhcnQgPSBlY2hhcnRzLmluaXQoZG9tLCBudWxsLCB7cmVuZGVyZXI6J2NhbnZhcyd9KTsKICB9IGVsc2UgewogICAgbW9kZWxzQ2hhcnQucmVzaXplKCk7CiAgfQoKICBjb25zdCBtb2RlbHMgPSB1c2FnZURhdGEuYnlfbW9kZWw7CiAgY29uc3QgbmFtZXMgPSBtb2RlbHMubWFwKG0gPT4gbS5tb2RlbD8ucmVwbGFjZSgnZGVlcHNlZWstJywnJykgfHwgJz8nKTsKICBjb25zdCBjb3N0cyA9IG1vZGVscy5tYXAobSA9PiBtLmVzdGltYXRlZF9jb3N0X3VzZCB8fCAwKTsKCiAgbW9kZWxzQ2hhcnQuc2V0T3B0aW9uKHsKICAgIGRhcmtNb2RlOiB0cnVlLAogICAgYmFja2dyb3VuZENvbG9yOiAndHJhbnNwYXJlbnQnLAogICAgdG9vbHRpcDoge3RyaWdnZXI6J2F4aXMnLGF4aXNQb2ludGVyOnt0eXBlOidzaGFkb3cnfX0sCiAgICBncmlkOiB7bGVmdDoxMDAsIHJpZ2h0OjEyLCB0b3A6MTIsIGJvdHRvbTo4fSwKICAgIHhBeGlzOiB7dHlwZTondmFsdWUnLGF4aXNMYWJlbDp7Y29sb3I6JyM2NDc0OEInLGZvbnRTaXplOjEwLGZvcm1hdHRlcjp2PT4nJCcrdi50b0ZpeGVkKDIpfSxzcGxpdExpbmU6e2xpbmVTdHlsZTp7Y29sb3I6JyMxRTMzNEYnfX19LAogICAgeUF4aXM6IHt0eXBlOidjYXRlZ29yeScsZGF0YTpuYW1lcyxheGlzTGFiZWw6e2NvbG9yOicjOTRBM0I4Jyxmb250U2l6ZToxMH0sYXhpc0xpbmU6e2xpbmVTdHlsZTp7Y29sb3I6JyMxRTMzNEYnfX19LAogICAgc2VyaWVzOiBbewogICAgICB0eXBlOidiYXInLGRhdGE6Y29zdHMsaXRlbVN0eWxlOntjb2xvcjpuZXcgZWNoYXJ0cy5ncmFwaGljLkxpbmVhckdyYWRpZW50KDAsMCwxLDAsWwogICAgICAgIHtvZmZzZXQ6MCxjb2xvcjonIzE3MjIzNid9LHtvZmZzZXQ6MSxjb2xvcjonIzM4QkRGOCd9CiAgICAgIF0pfSxiYXJNYXhXaWR0aDoyNCwKICAgICAgbGFiZWw6e3Nob3c6dHJ1ZSxwb3NpdGlvbjoncmlnaHQnLGNvbG9yOicjOTRBM0I4Jyxmb250U2l6ZToxMCxmb3JtYXR0ZXI6cD0+JyQnK3AudmFsdWUudG9GaXhlZCgzKX0KICAgIH1dCiAgfSk7Cn0KCi8vID09PT09IFJFTkRFUjogU0VTU0lPTlMgPT09PT0KZnVuY3Rpb24gcmVuZGVyU2Vzc2lvbnMoc2Vzc2lvbnNEYXRhKSB7CiAgY29uc3QgZWwgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnc2Vzc2lvbnMtbGlzdCcpOwogIGNvbnN0IGNvdW50RWwgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnc2Vzc2lvbi1jb3VudCcpOwoKICBpZiAoIXNlc3Npb25zRGF0YSB8fCBzZXNzaW9uc0RhdGEuX2Vycm9yKSB7CiAgICBlbC5pbm5lckhUTUwgPSAnPGRpdiBjbGFzcz0ic3RhdGUtbXNnIiBzdHlsZT0ibWluLWhlaWdodDoxNTBweCI+PGRpdiBjbGFzcz0iZGVzYyBib2R5LXNtIiBzdHlsZT0iY29sb3I6dmFyKC0tdGV4dE11dGVkKSI+TmllIG1vxbxuYSB6YcWCYWRvd2HEhyBzZXNqaTwvZGl2PjwvZGl2Pic7CiAgICBjb3VudEVsLnRleHRDb250ZW50ID0gJy0tJzsKICAgIHJldHVybjsKICB9CgogIGNvbnN0IHNlc3Npb25zID0gc2Vzc2lvbnNEYXRhLnNlc3Npb25zIHx8IFtdOwogIGNvdW50RWwudGV4dENvbnRlbnQgPSBzZXNzaW9ucy5sZW5ndGggKyAnIHNlc2ppJzsKCiAgaWYgKHNlc3Npb25zLmxlbmd0aCA9PT0gMCkgewogICAgZWwuaW5uZXJIVE1MID0gJzxkaXYgY2xhc3M9InN0YXRlLW1zZyIgc3R5bGU9Im1pbi1oZWlnaHQ6MTUwcHgiPjxkaXYgY2xhc3M9ImRlc2MgYm9keS1zbSIgc3R5bGU9ImNvbG9yOnZhcigtLXRleHRNdXRlZCkiPkJyYWsgc2Vzamkg4oCUIHphY3puaWogcm96bW93xJkgeiBIZXJtZXNlbTwvZGl2PjwvZGl2Pic7CiAgICByZXR1cm47CiAgfQoKICBlbC5pbm5lckhUTUwgPSBzZXNzaW9ucy5zbGljZSgwLDE1KS5tYXAocyA9PiB7CiAgICBjb25zdCBzb3VyY2VJY29uID0gcy5zb3VyY2UgPT09ICd0ZWxlZ3JhbScgPyAn8J+TsScgOiBzLnNvdXJjZSA9PT0gJ2thbmJhbicgPyAn8J+TiycgOiAn8J+Suyc7CiAgICBjb25zdCBuYW1lID0gcy5kaXNwbGF5X25hbWUgfHwgcy5pZD8uc2xpY2UoMCwxNikgfHwgJy0tJzsKICAgIHJldHVybiBgPGRpdiBjbGFzcz0ic2Vzc2lvbi1yb3ciPgogICAgICA8ZGl2IHRpdGxlPSIke2VzY2FwZUh0bWwocy5zb3VyY2UpfSI+JHtzb3VyY2VJY29ufTwvZGl2PgogICAgICA8ZGl2PgogICAgICAgIDxkaXYgY2xhc3M9ImJvZHktc20iIHN0eWxlPSJjb2xvcjp2YXIoLS10ZXh0UHJpbWFyeSkiPiR7ZXNjYXBlSHRtbChuYW1lKX08L2Rpdj4KICAgICAgICA8ZGl2IGNsYXNzPSJib2R5LXNtIiBzdHlsZT0iY29sb3I6dmFyKC0tdGV4dE11dGVkKSI+JHtlc2NhcGVIdG1sKHMubW9kZWx8fCctLScpfSDCtyAke3MubWVzc2FnZV9jb3VudHx8MH0gbXNnIMK3ICR7cy5hcGlfY2FsbF9jb3VudHx8MH0gY2FsbDwvZGl2PgogICAgICA8L2Rpdj4KICAgICAgPGRpdiBjbGFzcz0iaGlkZS1tb2JpbGUgbW9uby1zbSIgc3R5bGU9ImNvbG9yOnZhcigtLXRleHRTZWNvbmRhcnkpIj4ke2Zvcm1hdE51bWJlcihzLnRva2Vucz8udG90YWx8fDApfSB0b2suPC9kaXY+CiAgICAgIDxkaXYgY2xhc3M9ImhpZGUtbW9iaWxlIG1vbm8tc20iIHN0eWxlPSJjb2xvcjp2YXIoLS10ZXh0U2Vjb25kYXJ5KSI+JHtmb3JtYXRDb3N0KHMuY29zdD8uZXN0aW1hdGVkX3VzZCl9PC9kaXY+CiAgICAgIDxkaXYgY2xhc3M9ImhpZGUtbW9iaWxlIGJvZHktc20iIHN0eWxlPSJjb2xvcjp2YXIoLS10ZXh0TXV0ZWQpIj4ke3RpbWVBZ28ocy5sYXN0X2FjdGl2aXR5X2F0KX08L2Rpdj4KICAgIDwvZGl2PmA7CiAgfSkuam9pbignJyk7Cn0KCi8vID09PT09IFJFTkRFUjogQUxFUlRTID09PT09CmZ1bmN0aW9uIHJlbmRlckFsZXJ0cyhhbGVydHNEYXRhKSB7CiAgY29uc3QgZWwgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYWxlcnRzLWxpc3QnKTsKICBjb25zdCBjb3VudEVsID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2FsZXJ0LWNvdW50Jyk7CgogIGlmICghYWxlcnRzRGF0YSB8fCBhbGVydHNEYXRhLl9lcnJvcikgewogICAgZWwuaW5uZXJIVE1MID0gJzxkaXYgY2xhc3M9InN0YXRlLW1zZyIgc3R5bGU9Im1pbi1oZWlnaHQ6MTUwcHgiPjxkaXYgY2xhc3M9ImRlc2MgYm9keS1zbSIgc3R5bGU9ImNvbG9yOnZhcigtLXRleHRNdXRlZCkiPk5pZSBtb8W8bmEgemHFgmFkb3dhxIcgYWxlcnTDs3c8L2Rpdj48L2Rpdj4nOwogICAgY291bnRFbC5zdHlsZS5kaXNwbGF5ID0gJ25vbmUnOwogICAgcmV0dXJuOwogIH0KCiAgY29uc3QgYWxlcnRzID0gYWxlcnRzRGF0YS5hbGVydHMgfHwgW107CiAgaWYgKGFsZXJ0cy5sZW5ndGggPT09IDApIHsKICAgIGNvdW50RWwuc3R5bGUuZGlzcGxheSA9ICdub25lJzsKICAgIGVsLmlubmVySFRNTCA9ICc8ZGl2IGNsYXNzPSJzdGF0ZS1tc2ciIHN0eWxlPSJtaW4taGVpZ2h0OjE1MHB4Ij48ZGl2IGNsYXNzPSJkZXNjIGJvZHktc20iIHN0eWxlPSJjb2xvcjp2YXIoLS10ZXh0TXV0ZWQpIj5CcmFrIGFrdHl3bnljaCBhbGVydMOzdyDinJM8L2Rpdj48L2Rpdj4nOwogICAgcmV0dXJuOwogIH0KCiAgY291bnRFbC5zdHlsZS5kaXNwbGF5ID0gJ2lubGluZS1ibG9jayc7CiAgY291bnRFbC50ZXh0Q29udGVudCA9IGFsZXJ0cy5sZW5ndGg7CiAgY291bnRFbC5jbGFzc05hbWUgPSBhbGVydHMuc29tZShhPT5hLmxldmVsPT09J2NyaXRpY2FsJykgPyAnYmFkZ2UgZXJyJyA6ICdiYWRnZSB3YXJuJzsKCiAgZWwuaW5uZXJIVE1MID0gYWxlcnRzLm1hcChhID0+IHsKICAgIGNvbnN0IHRzID0gYS50cyA/IG5ldyBEYXRlKGEudHMqMTAwMCkudG9Mb2NhbGVTdHJpbmcoJ3BsLVBMJyx7dGltZVpvbmU6J0V1cm9wZS9XYXJzYXcnfSkgOiAnLS0nOwogICAgcmV0dXJuIGA8ZGl2IGNsYXNzPSJhbGVydC1yb3cgJHthLmxldmVsfSI+CiAgICAgIDxkaXYgY2xhc3M9ImFsZXJ0LWJvZHkiPgogICAgICAgIDxkaXYgY2xhc3M9ImxhYmVsLWxnIiBzdHlsZT0iY29sb3I6JHthLmxldmVsPT09J2NyaXRpY2FsJz8ndmFyKC0tY3JpdGljYWwpJzondmFyKC0td2FybmluZyknfSI+JHthLmxldmVsLnRvVXBwZXJDYXNlKCl9PC9kaXY+CiAgICAgICAgPGRpdiBjbGFzcz0iYm9keS1zbSIgc3R5bGU9ImNvbG9yOnZhcigtLXRleHRQcmltYXJ5KSI+JHtlc2NhcGVIdG1sKGEubWVzc2FnZSl9PC9kaXY+CiAgICAgICAgPGRpdiBjbGFzcz0iYWxlcnQtdHMgbW9uby1zbSI+JHt0c308L2Rpdj4KICAgICAgPC9kaXY+CiAgICAgICR7IWEuYWNrbm93bGVkZ2VkID8gYDxidXR0b24gY2xhc3M9ImFjay1idG4iIG9uY2xpY2s9ImFja0FsZXJ0KCR7YS5pZH0pIj5Qb3R3aWVyZMW6PC9idXR0b24+YCA6IGA8c3BhbiBjbGFzcz0iYm9keS1zbSIgc3R5bGU9ImNvbG9yOnZhcigtLXRleHRNdXRlZCkiPuKckyBPSzwvc3Bhbj5gfQogICAgPC9kaXY+YDsKICB9KS5qb2luKCcnKTsKfQoKYXN5bmMgZnVuY3Rpb24gYWNrQWxlcnQoaWQpIHsKICB0cnkgewogICAgYXdhaXQgZmV0Y2goQVBJX0JBU0UgKyAnL2FwaS9hbGVydHMvJyArIGlkICsgJy9hY2tub3dsZWRnZScsIHttZXRob2Q6J1BPU1QnfSk7CiAgICBzaG93VG9hc3QoJ0FsZXJ0IHBvdHdpZXJkem9ueScsICcnKTsKICAgIHJlZnJlc2hBbGwoKTsKICB9IGNhdGNoKGUpIHsKICAgIHNob3dUb2FzdCgnQsWCxIVkIHBvdHdpZXJkemFuaWEgYWxlcnR1JywgJ2NyaXRpY2FsJyk7CiAgfQp9CgovLyA9PT09PSBSRU5ERVI6IEZPT1RFUiA9PT09PQpmdW5jdGlvbiByZW5kZXJGb290ZXIoa2V5c0RhdGEsIGthbmJhbkRhdGEsIHN0YXR1c0RhdGEpIHsKICAvLyBLZXlzCiAgY29uc3Qga2V5c0VsID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2Zvb3Rlci1rZXlzJyk7CiAgaWYgKGtleXNEYXRhICYmICFrZXlzRGF0YS5fZXJyb3IgJiYga2V5c0RhdGEuYXBpX2tleXNfc2V0Py5sZW5ndGgpIHsKICAgIGtleXNFbC5pbm5lckhUTUwgPSBrZXlzRGF0YS5hcGlfa2V5c19zZXQubWFwKGsgPT4gYDxzcGFuIGNsYXNzPSJrZXktY2hpcCI+JHtlc2NhcGVIdG1sKGspfTwvc3Bhbj5gKS5qb2luKCcnKTsKICB9IGVsc2UgewogICAga2V5c0VsLmlubmVySFRNTCA9ICc8ZGl2IGNsYXNzPSJib2R5LXNtIiBzdHlsZT0iY29sb3I6dmFyKC0tdGV4dE11dGVkKSI+QnJhayBkYW55Y2g8L2Rpdj4nOwogIH0KCiAgLy8gS2FuYmFuCiAgY29uc3Qga2FuYmFuRWwgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZm9vdGVyLWthbmJhbicpOwogIGlmIChrYW5iYW5EYXRhICYmICFrYW5iYW5EYXRhLl9lcnJvciAmJiBrYW5iYW5EYXRhLnRhc2tzX2J5X3N0YXR1cykgewogICAgY29uc3QgcyA9IGthbmJhbkRhdGEudGFza3NfYnlfc3RhdHVzOwogICAga2FuYmFuRWwuaW5uZXJIVE1MID0gYAogICAgICA8ZGl2IHN0eWxlPSJkaXNwbGF5OmZsZXg7Z2FwOnZhcigtLXNwYWNlLW1kKSI+CiAgICAgICAgPGRpdj48c3BhbiBjbGFzcz0iYmFkZ2Ugb2siPmRvbmU8L3NwYW4+IDxzcGFuIGNsYXNzPSJtZXRyaWMtbWQiPiR7cy5kb25lfHwwfTwvc3Bhbj48L2Rpdj4KICAgICAgICA8ZGl2PjxzcGFuIGNsYXNzPSJiYWRnZSIgc3R5bGU9ImJhY2tncm91bmQ6IzFFM0E1Rjtjb2xvcjp2YXIoLS1wcmltYXJ5KSI+cnVubmluZzwvc3Bhbj4gPHNwYW4gY2xhc3M9Im1ldHJpYy1tZCI+JHtzLnJ1bm5pbmd8fDB9PC9zcGFuPjwvZGl2PgogICAgICAgIDxkaXY+PHNwYW4gY2xhc3M9ImJhZGdlIiBzdHlsZT0iYmFja2dyb3VuZDp2YXIoLS1iZ0hvdmVyKTtjb2xvcjp2YXIoLS10ZXh0U2Vjb25kYXJ5KSI+dG9kbzwvc3Bhbj4gPHNwYW4gY2xhc3M9Im1ldHJpYy1tZCI+JHtzLnRvZG98fDB9PC9zcGFuPjwvZGl2PgogICAgICA8L2Rpdj4KICAgIGA7CiAgfSBlbHNlIHsKICAgIGthbmJhbkVsLmlubmVySFRNTCA9ICc8ZGl2IGNsYXNzPSJib2R5LXNtIiBzdHlsZT0iY29sb3I6dmFyKC0tdGV4dE11dGVkKSI+QnJhayBkYW55Y2g8L2Rpdj4nOwogIH0KCiAgLy8gU3lzdGVtIGluZm8gKGZyb20gc3RhdHVzIHN1bW1hcnkpCiAgY29uc3Qgc3lzRWwgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZm9vdGVyLXN5c3RlbScpOwogIGNvbnN0IHN1bW1hcnkgPSBzdGF0dXNEYXRhPy5zdW1tYXJ5IHx8IHt9OwogIHN5c0VsLmlubmVySFRNTCA9IGAKICAgIDxkaXYgY2xhc3M9ImJvZHktc20iIHN0eWxlPSJjb2xvcjp2YXIoLS10ZXh0U2Vjb25kYXJ5KSI+UHJvZmlsaTogPHNwYW4gY2xhc3M9Im1vbm8tc20iIHN0eWxlPSJjb2xvcjp2YXIoLS10ZXh0UHJpbWFyeSkiPiR7c3VtbWFyeS5wcm9maWxlc190b3RhbHx8Jy0tJ308L3NwYW4+PC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJib2R5LXNtIiBzdHlsZT0iY29sb3I6dmFyKC0tdGV4dFNlY29uZGFyeSkiPkFrdHl3bmUgYWdlbnR5OiA8c3BhbiBjbGFzcz0ibW9uby1zbSIgc3R5bGU9ImNvbG9yOnZhcigtLXRleHRQcmltYXJ5KSI+JHtzdW1tYXJ5LmFjdGl2ZV9hZ2VudHN8fDB9PC9zcGFuPjwvZGl2PgogICAgPGRpdiBjbGFzcz0iYm9keS1zbSIgc3R5bGU9ImNvbG9yOnZhcigtLXRleHRTZWNvbmRhcnkpIj5CYWNrZW5kOiA8c3BhbiBjbGFzcz0ibW9uby1zbSIgc3R5bGU9ImNvbG9yOnZhcigtLXRleHRQcmltYXJ5KSI+MTI3LjAuMC4xOjkxMTg8L3NwYW4+PC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJib2R5LXNtIiBzdHlsZT0iY29sb3I6dmFyKC0tdGV4dFNlY29uZGFyeSkiPk9kxZt3aWXFvGFuaWU6IDxzcGFuIGNsYXNzPSJtb25vLXNtIiBzdHlsZT0iY29sb3I6dmFyKC0tdGV4dFByaW1hcnkpIj4ke1JFRlJFU0hfSU5URVJWQUwvMTAwMH1zPC9zcGFuPjwvZGl2PgogIGA7Cn0KCi8vID09PT09IERPV05MT0FEIEFTIEhUTUwgRklMRSA9PT09PQpmdW5jdGlvbiBkb3dubG9hZERhc2hib2FyZCgpIHsKICBjb25zdCBodG1sID0gZG9jdW1lbnQuZG9jdW1lbnRFbGVtZW50Lm91dGVySFRNTDsKICBjb25zdCBibG9iID0gbmV3IEJsb2IoWyc8IURPQ1RZUEUgaHRtbD5cbicgKyBodG1sXSwge3R5cGU6J3RleHQvaHRtbCd9KTsKICBjb25zdCB1cmwgPSBVUkwuY3JlYXRlT2JqZWN0VVJMKGJsb2IpOwogIGNvbnN0IGEgPSBkb2N1bWVudC5jcmVhdGVFbGVtZW50KCdhJyk7CiAgYS5ocmVmID0gdXJsOwogIGEuZG93bmxvYWQgPSAnaGVybWVzLW1vbml0b3ItZGFzaGJvYXJkLmh0bWwnOwogIGEuY2xpY2soKTsKICBVUkwucmV2b2tlT2JqZWN0VVJMKHVybCk7Cn0KCi8vID09PT09IE1BSU4gUkVGUkVTSCA9PT09PQphc3luYyBmdW5jdGlvbiByZWZyZXNoQWxsKCkgewogIGNvbnN0IG5vdyA9IG5ldyBEYXRlKCk7CiAgY29uc3QgY2V0ID0gbmV3IERhdGUobm93LnRvTG9jYWxlU3RyaW5nKCdlbi1VUycsIHt0aW1lWm9uZTonRXVyb3BlL1dhcnNhdyd9KSk7CiAgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2xhc3QtcmVmcmVzaCcpLnRleHRDb250ZW50ID0KICAgIGNldC50b0xvY2FsZVRpbWVTdHJpbmcoJ3BsLVBMJywge2hvdXI6JzItZGlnaXQnLG1pbnV0ZTonMi1kaWdpdCcsc2Vjb25kOicyLWRpZ2l0J30pOwoKICB0cnkgewogICAgY29uc3QgW3N0YXR1cywgc2Vzc2lvbnMsIHVzYWdlLCBrYW5iYW4sIGFsZXJ0cywga2V5c10gPSBhd2FpdCBQcm9taXNlLmFsbChbCiAgICAgIGFwaUZldGNoKCcvYXBpL3N0YXR1cycpLAogICAgICBhcGlGZXRjaCgnL2FwaS9zZXNzaW9ucz9wcm9maWxlPScgKyBERUZBVUxUX1BST0ZJTEUgKyAnJmxpbWl0PTIwJyksCiAgICAgIGFwaUZldGNoKCcvYXBpL3VzYWdlP3Byb2ZpbGU9JyArIERFRkFVTFRfUFJPRklMRSArICcmZGF5cz0xNCcpLAogICAgICBhcGlGZXRjaCgnL2FwaS9rYW5iYW4nKSwKICAgICAgYXBpRmV0Y2goJy9hcGkvYWxlcnRzJyksCiAgICAgIGFwaUZldGNoKCcvYXBpL2tleXM/cHJvZmlsZT0nICsgREVGQVVMVF9QUk9GSUxFKQogICAgXSk7CgogICAgcmVuZGVyU3RhdHVzU3RyaXAoc3RhdHVzKTsKICAgIHJlbmRlcktwaUdyaWQoc3RhdHVzLCB1c2FnZSwgc2Vzc2lvbnMsIGthbmJhbiwgYWxlcnRzLCBrZXlzKTsKICAgIHJlbmRlclNlc3Npb25zKHNlc3Npb25zKTsKICAgIHJlbmRlckFsZXJ0cyhhbGVydHMpOwogICAgcmVuZGVyRm9vdGVyKGtleXMsIGthbmJhbiwgc3RhdHVzKTsKCiAgICAvLyBDaGFydHMgKHJlc2l6ZS1hd2FyZSkKICAgIHJlbmRlclVzYWdlQ2hhcnQodXNhZ2UpOwogICAgcmVuZGVyTW9kZWxzQ2hhcnQodXNhZ2UpOwogIH0gY2F0Y2goZSkgewogICAgc2hvd1RvYXN0KCdCxYLEhWQgb2TFm3dpZcW8YW5pYTogJyArIGUubWVzc2FnZSwgJ2NyaXRpY2FsJyk7CiAgfQp9CgovLyA9PT09PSBJTklUID09PT09CmZ1bmN0aW9uIGluaXQoKSB7CiAgLy8gQWRkIGRvd25sb2FkIGJ1dHRvbiB0byB0b3BiYXIKICBjb25zdCByaWdodCA9IGRvY3VtZW50LnF1ZXJ5U2VsZWN0b3IoJy50b3BiYXItcmlnaHQnKTsKICBjb25zdCBidG4gPSBkb2N1bWVudC5jcmVhdGVFbGVtZW50KCdidXR0b24nKTsKICBidG4uY2xhc3NOYW1lID0gJ2Rvd25sb2FkLWJ0bic7CiAgYnRuLnRleHRDb250ZW50ID0gJ+KshyBQb2JpZXJ6JzsKICBidG4ub25jbGljayA9IGRvd25sb2FkRGFzaGJvYXJkOwogIHJpZ2h0Lmluc2VydEJlZm9yZShidG4sIHJpZ2h0LmZpcnN0Q2hpbGQpOwoKICAvLyBTaG93IGxvYWRpbmcgc2tlbGV0b25zCiAgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2twaS1ncmlkJykuaW5uZXJIVE1MID0gQXJyYXkoOCkuZmlsbCgnPGRpdiBjbGFzcz0ibWV0cmljLXRpbGUiPjxkaXYgY2xhc3M9InNrZWxldG9uIHNrZWxldG9uLXRleHQiPjwvZGl2PjxkaXYgY2xhc3M9InNrZWxldG9uIHNrZWxldG9uLXZhbHVlIj48L2Rpdj48ZGl2IGNsYXNzPSJza2VsZXRvbiBza2VsZXRvbi10ZXh0IiBzdHlsZT0id2lkdGg6NDAlIj48L2Rpdj48L2Rpdj4nKS5qb2luKCcnKTsKICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnc2Vzc2lvbnMtbGlzdCcpLmlubmVySFRNTCA9ICc8ZGl2IGNsYXNzPSJzdGF0ZS1tc2ciIHN0eWxlPSJtaW4taGVpZ2h0OjE1MHB4Ij48ZGl2IGNsYXNzPSJkZXNjIGJvZHktc20iIHN0eWxlPSJjb2xvcjp2YXIoLS10ZXh0TXV0ZWQpIj7FgWFkb3dhbmllLi4uPC9kaXY+PC9kaXY+JzsKCiAgLy8gU2tlbGV0b24gY2hpcHMgZm9yIHN0YXR1cyBzdHJpcCAocGxhY2Vob2xkZXIgZHVyaW5nIGluaXRpYWwgbG9hZCkKICBjb25zdCBza2VsZXRvbkNoaXBzID0gQXJyYXkoNikuZmlsbCgnPGRpdiBjbGFzcz0ic3RhdHVzLWNoaXAgc2tlbGV0b24tY2hpcCI+PGRpdiBjbGFzcz0ic2tlbGV0b24iIHN0eWxlPSJ3aWR0aDo4cHg7aGVpZ2h0OjhweDtib3JkZXItcmFkaXVzOjUwJTtmbGV4LXNocmluazowIj48L2Rpdj48ZGl2IGNsYXNzPSJza2VsZXRvbiBza2VsZXRvbi10ZXh0IiBzdHlsZT0id2lkdGg6NjBweDtoZWlnaHQ6MC43NXJlbTttYXJnaW46MCI+PC9kaXY+PC9kaXY+Jykuam9pbignJyk7CiAgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3N0YXR1cy1zdHJpcC1pbm5lcicpLmlubmVySFRNTCA9IHNrZWxldG9uQ2hpcHM7CgogIC8vIEluaXRpYWwgbG9hZAogIHJlZnJlc2hBbGwoKTsKCiAgLy8gQXV0by1yZWZyZXNoCiAgcmVmcmVzaFRpbWVyID0gc2V0SW50ZXJ2YWwocmVmcmVzaEFsbCwgUkVGUkVTSF9JTlRFUlZBTCk7CgogIC8vIFJlc2l6ZSBjaGFydHMgb24gd2luZG93IHJlc2l6ZQogIHdpbmRvdy5hZGRFdmVudExpc3RlbmVyKCdyZXNpemUnLCAoKSA9PiB7CiAgICBpZiAodXNhZ2VDaGFydCkgdXNhZ2VDaGFydC5yZXNpemUoKTsKICAgIGlmIChtb2RlbHNDaGFydCkgbW9kZWxzQ2hhcnQucmVzaXplKCk7CiAgfSk7Cn0KCmRvY3VtZW50LmFkZEV2ZW50TGlzdGVuZXIoJ0RPTUNvbnRlbnRMb2FkZWQnLCBpbml0KTsKPC9zY3JpcHQ+CjwvYm9keT4KPC9odG1sPgo="
+
+          def get_html():
+              """Dekoduje HTML z base64 z podmianą API_BASE."""
+              if HTML_B64 == "REPLACE_WITH_B64_HTML":
+                  return "<h1>Hermes Monitor</h1><p>Frontend nie został jeszcze osadzony.</p>"
+              html = base64.b64decode(HTML_B64).decode("utf-8")
+              # Podmień API_BASE na względną ścieżkę
+              html = re.sub(
+                  r"const API_BASE\s*=\s*['\"][^'\"]+['\"]",
+                  "const API_BASE = ''",
+                  html,
+              )
+              return html
+
+          # --- HTTP Server -------------------------------------------------------------
+          class Handler(BaseHTTPRequestHandler):
+              def _json(self, obj, code=200):
+                  body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                  self.send_response(code)
+                  self.send_header("Content-Type", "application/json; charset=utf-8")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.send_header("Access-Control-Allow-Origin", "*")
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def _html(self, body, code=200):
+                  body = body.encode("utf-8")
+                  self.send_response(code)
+                  self.send_header("Content-Type", "text/html; charset=utf-8")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def _svg(self, body, code=200):
+                  body = body.encode("utf-8")
+                  self.send_response(code)
+                  self.send_header("Content-Type", "image/svg+xml")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def _cors_headers(self):
+                  self.send_header("Access-Control-Allow-Origin", "*")
+                  self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                  self.send_header("Access-Control-Allow-Headers", "*")
+
+              def _read_body(self):
+                  length = int(self.headers.get("Content-Length", 0))
+                  return self.rfile.read(length) if length else b""
+
+              def _parse_path(self):
+                  parsed = urllib.parse.urlsplit(self.path)
+                  qs = urllib.parse.parse_qs(parsed.query)
+                  return parsed.path, qs
+
+              def do_OPTIONS(self):
+                  self.send_response(204)
+                  self._cors_headers()
+                  self.send_header("Content-Length", "0")
+                  self.end_headers()
+
+              def do_GET(self):
+                  path, qs = self._parse_path()
+
+                  if path == "/":
+                      self._html(get_html())
+
+                  elif path == "/api/health":
+                      self._json({"status": "ok", "version": "1.0.0", "backend": "bob-hermes-monitor"})
+
+                  elif path == "/api/status":
+                      snap = get_snapshot()
+                      if not snap:
+                          collect_all()
+                          snap = get_snapshot()
+                      self._json({
+                          "ts": snap.get("ts_iso") if snap else None,
+                          "summary": snap.get("summary") if snap else {},
+                          "profiles": [
+                              {"profile": p["profile"], "home": p["home"],
+                               "gateway": p["gateway"], "cron_ticker": p["cron_ticker"]}
+                              for p in (snap.get("profiles", []) if snap else [])
+                          ],
+                      })
+
+                  elif path == "/api/sessions":
+                      profile = qs.get("profile", ["programista"])[0]
+                      limit = min(int(qs.get("limit", [20])[0]), 100)
+                      self._json({"sessions": _get_sessions(profile, limit), "profile": profile})
+
+                  elif path == "/api/usage":
+                      profile = qs.get("profile", ["programista"])[0]
+                      days = min(int(qs.get("days", [7])[0]), 90)
+                      self._json(_get_usage_stats(profile, days))
+
+                  elif path == "/api/cron/jobs":
+                      profile = qs.get("profile", ["programista"])[0]
+                      self._json({"profile": profile, "jobs": _get_cron_jobs(profile)})
+
+                  elif path == "/api/kanban":
+                      self._json(_get_kanban_summary())
+
+                  elif path == "/api/keys":
+                      profile = qs.get("profile", ["programista"])[0]
+                      env_names = _read_env_names(profile)
+                      auth_status = _parse_auth_status(profile)
+                      self._json({"profile": profile, "api_keys_set": env_names, "auth_providers": auth_status})
+
+                  elif path == "/api/logs/errors":
+                      profile = qs.get("profile", ["programista"])[0]
+                      since_h = min(int(qs.get("since_hours", [1])[0]), 168)
+                      self._json({
+                          "profile": profile,
+                          "errors": _read_log_summary(profile, "errors.log", since_h),
+                          "agent": _read_log_summary(profile, "agent.log", since_h),
+                      })
+
+                  elif path == "/api/alerts":
+                      self._json({"alerts": _get_active_alerts()})
+
+                  elif path == "/api/snapshot":
+                      snap = get_snapshot() or collect_all()
+                      self._json(snap)
+
+                  elif path == "/widgets/hermes":
+                      self._json(widget_data())
+
+                  # /api/metrics/{metric_name}
+                  elif path.startswith("/api/metrics/"):
+                      metric_name = path[len("/api/metrics/"):]
+                      hours = min(int(qs.get("hours", [24])[0]), 720)
+                      self._json({"metric": metric_name, "hours": hours, "data": _get_metric_history(metric_name, hours)})
+
+                  # /api/alerts/{id}/acknowledge — tylko POST, GET zwraca 405
+                  elif re.match(r"^/api/alerts/\d+/acknowledge$", path):
+                      self.send_response(405)
+                      self.send_header("Content-Length", "0")
+                      self.end_headers()
+
+                  # icon.svg (dla app_proxy UmbrelOS)
+                  elif path == "/icon.svg":
+                      icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.svg")
+                      if os.path.exists(icon_path):
+                          self._svg(open(icon_path).read())
+                      else:
+                          self.send_response(404)
+                          self.end_headers()
+
+                  else:
+                      self.send_response(404)
+                      self.send_header("Content-Length", "0")
+                      self.end_headers()
+
+              def do_POST(self):
+                  path, qs = self._parse_path()
+
+                  # /api/alerts/{id}/acknowledge
+                  m = re.match(r"^/api/alerts/(\d+)/acknowledge$", path)
+                  if m:
+                      alert_id = int(m.group(1))
+                      _acknowledge_alert(alert_id)
+                      self._json({"status": "ok", "alert_id": alert_id})
+                      return
+
+                  self.send_response(404)
+                  self.send_header("Content-Length", "0")
+                  self.end_headers()
+
+              def log_message(self, *args):
+                  pass  # cicho
+
+
+          def main():
+              os.makedirs(DATA_DIR, exist_ok=True)
+              init_dashboard_db()
+              print(f"[hermes-monitor] Starting server on 0.0.0.0:{PORT}")
+              threading.Thread(target=collector_loop, daemon=True).start()
+              HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+
+
+          if __name__ == "__main__":
+              main()
+
+          PYEOF
+          exec python3 /data/hermes_server.py

@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#172236"/>
+      <stop offset="100%" stop-color="#0B1121"/>
+    </linearGradient>
+    <linearGradient id="pulseGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#7C3AED"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Tło -->
+  <rect x="1.5" y="1.5" width="97" height="97" rx="24"
+        fill="url(#bg)" stroke="#2A3F5C" stroke-width="1.5"/>
+
+  <!-- Subtelny pierścień -->
+  <circle cx="50" cy="42" r="28" fill="#7C3AED" opacity="0.08"/>
+
+  <!-- Wykres pulsu (linia EKG) -->
+  <polyline points="12,55 24,55 28,35 32,55 36,42 40,55 44,38 48,55 52,48 56,55 60,30 64,55 68,45 72,55 76,40 80,55 88,55"
+            fill="none" stroke="url(#pulseGrad)" stroke-width="2.8"
+            stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Kropki statusu (zielone = aktywne) -->
+  <circle cx="28" cy="74" r="3.5" fill="#22C55E"/>
+  <circle cx="40" cy="74" r="3.5" fill="#22C55E"/>
+  <circle cx="52" cy="74" r="3.5" fill="#22C55E"/>
+  <circle cx="64" cy="74" r="3.5" fill="#64748B"/>
+  <circle cx="76" cy="74" r="3.5" fill="#64748B"/>
+
+  <!-- Pojedyncza kropka ostrzegawcza (akcent) -->
+  <circle cx="56" cy="30" r="2.5" fill="#F59E0B" opacity="0.8">
+    <animate attributeName="opacity" values="0.8;0.2;0.8" dur="2s" repeatCount="indefinite"/>
+  </circle>
+</svg>
