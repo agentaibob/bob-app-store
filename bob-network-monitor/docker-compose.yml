@@ -27,7 +27,7 @@ services:
         STATE = '/data/collector_state.json'
         DIAG_OUT = '/data/diag.json'
         DOCKER = '/var/run/docker.sock'
-
+        
         def docker_get(path):
             try:
                 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -63,7 +63,7 @@ services:
                 return json.loads(body.decode('utf-8', errors='replace'))
             except Exception:
                 return None
-
+        
         def main_iface():
             try:
                 with open('/proc/net/route') as f:
@@ -74,7 +74,7 @@ services:
             except Exception:
                 pass
             return None
-
+        
         def iface_bytes_from_file(path, iface):
             try:
                 with open(path) as f:
@@ -88,7 +88,7 @@ services:
             except Exception:
                 pass
             return None
-
+        
         def host_veth_ifindex_map():
             res = {}
             try:
@@ -103,17 +103,17 @@ services:
             except Exception:
                 pass
             return res
-
+        
         def container_eth0_iflink(pid):
             try:
                 with open('/proc/%s/root/sys/class/net/eth0/iflink' % pid) as f:
                     return int(f.read().strip())
             except Exception:
                 return None
-
+        
         def container_eth0_bytes(pid):
             return iface_bytes_from_file('/proc/%s/net/dev' % pid, 'eth0')
-
+        
         def nice_app_name(c):
             labels = c.get('Labels') or {}
             project = labels.get('com.docker.compose.project') or ''
@@ -125,7 +125,7 @@ services:
             n = re.sub(r'_\d+$', '', raw)
             n = n.replace('-', ' ').replace('_', ' ')
             return n.strip().title() or raw
-
+        
         def container_pid(cid):
             info = docker_get('/containers/%s/json' % cid)
             if not info:
@@ -134,9 +134,8 @@ services:
                 return int((info.get('State') or {}).get('Pid') or 0)
             except Exception:
                 return 0
-
+        
         def _parse_tcp_peers(path, v6=False):
-            """Parse /proc/net/tcp{6} for established remote IPs (return set of 'ip:port')."""
             peers = set()
             try:
                 with open(path) as f:
@@ -145,7 +144,7 @@ services:
                         if len(parts) < 4:
                             continue
                         st = parts[3]
-                        if st != '01':  # only ESTABLISHED
+                        if st != '01':
                             continue
                         rem = parts[2]
                         if ':' not in rem:
@@ -158,8 +157,6 @@ services:
                         if port == 0:
                             continue
                         if v6:
-                            # /proc/net/tcp6: 32 hex chars = 4 x 32-bit words,
-                            # each word in HOST (little-endian) byte order.
                             if len(hx) != 32:
                                 continue
                             words32 = [hx[i:i+8] for i in range(0, 32, 8)]
@@ -168,7 +165,6 @@ services:
                                 ip = socket.inet_ntop(socket.AF_INET6, bytes.fromhex(swapped))
                             except Exception:
                                 continue
-                            # IPv4-mapped ::ffff:a.b.c.d -> show as plain IPv4
                             m4 = re.match(r'^::ffff:(\d+\.\d+\.\d+\.\d+)$', ip)
                             if m4:
                                 ip = m4.group(1)
@@ -182,20 +178,18 @@ services:
             except Exception:
                 pass
             return peers
-
+        
         def container_peers(pid):
-            """Remote IPs the container is connected to (established TCP)."""
             peers = set()
             if not pid:
                 return peers
             peers |= _parse_tcp_peers('/proc/%s/net/tcp' % pid)
             peers |= _parse_tcp_peers('/proc/%s/net/tcp6' % pid, v6=True)
             return peers
-
-        # ---- Reverse DNS (PTR) with cache + background worker ----
-        dns_cache = {}      # ip -> hostname or None
-        DNS_TTL = 3600      # 1h
-
+        
+        dns_cache = {}
+        DNS_TTL = 3600
+        
         def _is_private(ip):
             if ip.startswith('10.') or ip.startswith('127.') or ip.startswith('192.168.'):
                 return True
@@ -206,12 +200,11 @@ services:
                     return True
             if ip.startswith('169.254.'):
                 return True
-            if ':' in ip:  # skip IPv6 PTR (slow, rarely useful)
+            if ':' in ip:
                 return True
             return False
-
+        
         def lookup_peer(ip):
-            """PTR reverse DNS with cache; returns hostname or None."""
             now = time.time()
             hit = dns_cache.get(ip)
             if hit is not None and now - hit[1] < DNS_TTL:
@@ -224,9 +217,8 @@ services:
                     name = None
             dns_cache[ip] = (name, now)
             return name
-
+        
         def dns_worker():
-            """Background: resolve unknown peer IPs without blocking the collector loop."""
             while True:
                 try:
                     ips = set()
@@ -240,107 +232,12 @@ services:
                 except Exception:
                     pass
                 time.sleep(10)
-
+        
         def fmt_peer(p):
-            """'ip:port' -> {'ip': ip, 'port': port, 'host': hostname} for table columns."""
             ip, _, port = p.rpartition(':')
             name = lookup_peer(ip)
             return {'ip': ip, 'port': port, 'host': name}
-
-        def build_app_stats():
-            """Returns (apps, diag). apps = [{name, rx, tx}] with real container counters."""
-            diag = {
-                'docker_sock': os.path.exists(DOCKER),
-                'docker_ok': False,
-                'containers': 0,
-                'mapped': 0,
-                'unmapped_veth': 0,
-                'method': 'none',
-                'error': ''
-            }
-            veth_idx = host_veth_ifindex_map()
-            host_veth_bytes = {}
-            try:
-                with open('/proc/net/dev') as f:
-                    for line in f.readlines()[2:]:
-                        if ':' not in line:
-                            continue
-                        name, data = line.split(':', 1)
-                        name = name.strip()
-                        if name.startswith('veth'):
-                            p = data.split()
-                            host_veth_bytes[name] = (int(p[0]), int(p[8]))
-            except Exception as e:
-                diag['error'] = 'host_veth:' + str(e)
-
-            containers = docker_get('/containers/json')
-            if not isinstance(containers, list) or not containers:
-                diag['error'] = diag.get('error') or 'docker_api_empty'
-                apps = []
-                for vn, (rx, tx) in host_veth_bytes.items():
-                    apps.append({'name': vn, 'rx': tx, 'tx': rx})
-                diag['unmapped_veth'] = len(apps)
-                diag['method'] = 'veth_fallback'
-                return apps, diag
-
-            diag['docker_ok'] = True
-            diag['containers'] = len(containers)
-            diag['method'] = 'iflink+counters'
-            agg = {}
-            used_veth = set()
-            leftover_veths = dict(host_veth_bytes)
-
-            def match_veth_by_counters(erx, etx):
-                """Host veth RX == container TX, host veth TX == container RX."""
-                for vn, (vr, vt) in list(leftover_veths.items()):
-                    if vt == erx and vr == etx:
-                        return vn
-                return None
-
-            for c in containers:
-                cid = c.get('Id') or ''
-                app = nice_app_name(c)
-                pid = container_pid(cid)
-                if not pid:
-                    continue
-                iflink = container_eth0_iflink(pid)
-                eth = container_eth0_bytes(pid)
-                rx = tx = 0
-                vn = None
-
-                # 1) iflink pairing (best, but AppArmor may block /proc/<pid>/root)
-                if iflink and iflink in veth_idx:
-                    vn = veth_idx[iflink]
-
-                # 2) counter pairing with correct orientation (fallback)
-                if vn is None and eth:
-                    vn = match_veth_by_counters(eth[0], eth[1])
-
-                if vn is not None and vn in leftover_veths:
-                    used_veth.add(vn)
-                    del leftover_veths[vn]
-                    diag['mapped'] += 1
-
-                # Prefer container-side counters (true app RX/TX)
-                if eth:
-                    rx, tx = eth
-                elif vn is not None:
-                    hr, ht = host_veth_bytes.get(vn, (0, 0))
-                    rx, tx = ht, hr  # swap: host RX = container TX
-                else:
-                    continue
-
-                if app not in agg:
-                    agg[app] = {'rx': 0, 'tx': 0}
-                agg[app]['rx'] += rx
-                agg[app]['tx'] += tx
-
-            apps = [{'name': n, 'rx': v['rx'], 'tx': v['tx']} for n, v in sorted(agg.items())]
-            diag['unmapped_veth'] = len(leftover_veths)
-            for vn, (hr, ht) in leftover_veths.items():
-                apps.append({'name': vn, 'rx': ht, 'tx': hr})
-            return apps, diag
-
+        
         baseline, app_baseline = {}, {}
         if os.path.exists(STATE):
             try:
@@ -351,17 +248,14 @@ services:
             except Exception:
                 pass
         prev = {}
-
-        # Cache the docker→name mapping (expensive); refresh every MAP_TTL seconds.
-        # The veth byte counters themselves are read fresh every loop iteration.
+        
         MAP_TTL = 12
-        name_map = {}      # veth_name -> display name
-        peers_map = {}     # display name -> sorted list of remote IPs
+        name_map = {}
+        peers_map = {}
         name_map_ts = 0.0
         last_diag = {}
-
+        
         def refresh_name_map():
-            """Rebuild veth→name mapping via docker API (expensive, so cached)."""
             global name_map, name_map_ts, last_diag, peers_map
             now = time.time()
             if now - name_map_ts < MAP_TTL and name_map:
@@ -404,7 +298,6 @@ services:
                         if vn and vn not in used:
                             mapping[vn] = app
                             used.add(vn)
-                            # collect remote IPs for this app
                             for peer in container_peers(pid):
                                 peers.setdefault(app, set()).add(peer)
                 for vname in host_veth_bytes:
@@ -426,10 +319,10 @@ services:
                              'containers': 0, 'mapped': 0, 'unmapped_veth': 0,
                              'method': 'fallback', 'error': str(e)}
             name_map_ts = now
-
+        
         refresh_name_map()
         threading.Thread(target=dns_worker, daemon=True).start()
-
+        
         while True:
             now = time.time()
             iface = main_iface()
@@ -452,11 +345,9 @@ services:
                     json.dump({'rx_total': rx_total, 'tx_total': tx_total, 'rx_rate': rx_rate, 'tx_rate': tx_rate, 'iface': iface}, f)
             except Exception:
                 pass
-
-            # Refresh docker→name map occasionally (docker API is expensive)
+        
             refresh_name_map()
-
-            # Fresh veth byte counters each second, mapped via cached names
+        
             app_rows = []
             try:
                 with open('/proc/net/dev') as f:
@@ -470,13 +361,11 @@ services:
                             p = data.split()
                             if len(p) >= 9:
                                 veth_lines.append((nm, int(p[0]), int(p[8])))
-                # Aggregate by display name (multiple veths may share an app)
                 agg = {}
                 for vn, vr, vt in veth_lines:
                     name = name_map.get(vn, vn)
                     if name not in agg:
                         agg[name] = {'rx': 0, 'tx': 0}
-                    # veth host RX = container TX, veth host TX = container RX
                     agg[name]['rx'] += vt
                     agg[name]['tx'] += vr
                 for name, vals in sorted(agg.items()):
@@ -496,7 +385,7 @@ services:
                     app_rows.append({'name': name, 'rx_total': arx, 'tx_total': atx, 'rx_rate': arxr, 'tx_rate': atxr, 'peers': peers})
             except Exception as e:
                 last_diag['error'] = 'veth_loop:' + str(e)
-
+        
             sa_rx = sum(x['rx_total'] for x in app_rows)
             sa_tx = sum(x['tx_total'] for x in app_rows)
             sys_row = {
@@ -522,11 +411,12 @@ services:
             except Exception:
                 pass
             time.sleep(1)
+        
         PYEOF
         exec python3 /data/collector.py
 
   server:
-    image: python:3.12-slim
+    image: python:3.13-slim
     restart: on-failure
     stop_grace_period: 30s
     init: true
@@ -536,96 +426,4 @@ services:
       - /bin/sh
       - -c
       - |
-        cat > /data/widget_server.py << 'PYEOF'
-        import json, base64
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-        STATS = '/data/netstats.json'
-        APP_STATS = '/data/appstats.json'
-        DIAG = '/data/diag.json'
-        PORT = 8124
-        VERSION = '1.0.26'
-        # HTML stored as base64 so docker-compose YAML stays valid
-        HTML = base64.b64decode(
-            'PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9InBsIj48aGVhZD4KPG1ldGEgY2hhcnNldD0idXRmLTgiPjxtZXRhIG5hbWU9InZpZXdwb3J0IiBjb250ZW50PSJ3aWR0aD1kZXZpY2Utd2lkdGgsaW5pdGlhbC1zY2FsZT0xIj4KPHRpdGxlPlZBVUxULVRFQyBORVRXT1JLIE1PTklUT1Igdl9fVkVSX188L3RpdGxlPgo8bGluayByZWw9InByZWNvbm5lY3QiIGhyZWY9Imh0dHBzOi8vZm9udHMuZ29vZ2xlYXBpcy5jb20iPgo8bGluayBocmVmPSJodHRwczovL2ZvbnRzLmdvb2dsZWFwaXMuY29tL2NzczI/ZmFtaWx5PVNoYXJlK1RlY2grTW9ubyZkaXNwbGF5PXN3YXAiIHJlbD0ic3R5bGVzaGVldCI+CjxzdHlsZT4KKntib3gtc2l6aW5nOmJvcmRlci1ib3h9Cmh0bWwsYm9keXttYXJnaW46MDtwYWRkaW5nOjA7YmFja2dyb3VuZDojMDcwNzA1O21pbi1oZWlnaHQ6MTAwJX0KYm9keXtmb250LWZhbWlseTonU2hhcmUgVGVjaCBNb25vJywnQ291cmllciBOZXcnLG1vbm9zcGFjZTtjb2xvcjojZmZiMDAwOwogIGJhY2tncm91bmQ6cmFkaWFsLWdyYWRpZW50KGVsbGlwc2UgYXQgNTAlIDMwJSwjMGQwZDA3IDAlLCMwNzA3MDUgNzAlKTsKICBwYWRkaW5nOjE0cHg7ZGlzcGxheTpmbGV4O2p1c3RpZnktY29udGVudDpjZW50ZXJ9CiNzY3JlZW57cG9zaXRpb246cmVsYXRpdmU7d2lkdGg6MTAwJTttYXgtd2lkdGg6MTA4MHB4O2JhY2tncm91bmQ6IzBhMGEwNTsKICBib3JkZXI6MTBweCBzb2xpZCAjM2EzZjJjO2JvcmRlci1yYWRpdXM6MjZweDtib3gtc2hhZG93OjAgMCA0MHB4IHJnYmEoMjU1LDE3NiwwLC4xNCksCiAgaW5zZXQgMCAwIDYwcHggcmdiYSgwLDAsMCwuOSk7cGFkZGluZzoyMnB4IDI0cHggMTZweDtvdmVyZmxvdzpoaWRkZW59CiNzY3JlZW46OmJlZm9yZXtjb250ZW50OicnO3Bvc2l0aW9uOmFic29sdXRlO2luc2V0OjA7cG9pbnRlci1ldmVudHM6bm9uZTt6LWluZGV4OjU7CiAgYmFja2dyb3VuZDpyZXBlYXRpbmctbGluZWFyLWdyYWRpZW50KDBkZWcscmdiYSgwLDAsMCwuMzIpIDAgMXB4LHRyYW5zcGFyZW50IDFweCAzcHgpOwogIG1peC1ibGVuZC1tb2RlOm11bHRpcGx5fQojc2NyZWVuOjphZnRlcntjb250ZW50OicnO3Bvc2l0aW9uOmFic29sdXRlO2luc2V0OjA7cG9pbnRlci1ldmVudHM6bm9uZTt6LWluZGV4OjY7CiAgYmFja2dyb3VuZDpyYWRpYWwtZ3JhZGllbnQoZWxsaXBzZSBhdCA1MCUgNTAlLHRyYW5zcGFyZW50IDU1JSxyZ2JhKDAsMCwwLC41NSkgMTAwJSk7CiAgYW5pbWF0aW9uOmZsaWNrZXIgOHMgaW5maW5pdGV9CkBrZXlmcmFtZXMgZmxpY2tlcnswJSwxMDAle29wYWNpdHk6Ljk3fTkyJXtvcGFjaXR5Oi45N305MyV7b3BhY2l0eTouODJ9OTQle29wYWNpdHk6Ljk3fTk3JXtvcGFjaXR5Oi45fTk4JXtvcGFjaXR5Oi45N319CiNzY3JlZW4+ZGl2LCAjc2NyZWVuPmgxLCAjc2NyZWVuPnRhYmxlLCAjc2NyZWVuPi5mb290e3Bvc2l0aW9uOnJlbGF0aXZlO3otaW5kZXg6Mjt0ZXh0LXNoYWRvdzowIDAgNnB4IHJnYmEoMjU1LDE3NiwwLC41NSksMCAwIDE4cHggcmdiYSgyNTUsMTc2LDAsLjIyKX0KaDF7Zm9udC1zaXplOjIxcHg7bWFyZ2luOjA7bGV0dGVyLXNwYWNpbmc6MXB4O2ZvbnQtd2VpZ2h0OjQwMH0KaDEgLnZlcntjb2xvcjojOGE2ZDJhO2ZvbnQtc2l6ZToxM3B4fQouc3Vie2NvbG9yOiNiODg2MGI7Zm9udC1zaXplOjEycHg7bWFyZ2luLXRvcDozcHg7bGV0dGVyLXNwYWNpbmc6LjVweH0KLnN1YiAub2t7Y29sb3I6I2ZmZDc2ZX0KLmN1cnNvcntkaXNwbGF5OmlubGluZS1ibG9jazt3aWR0aDo5cHg7aGVpZ2h0OjE0cHg7YmFja2dyb3VuZDojZmZiMDAwO21hcmdpbi1sZWZ0OjZweDt2ZXJ0aWNhbC1hbGlnbjotMnB4O2FuaW1hdGlvbjpibGluayAxLjFzIHN0ZXBzKDEpIGluZmluaXRlfQpAa2V5ZnJhbWVzIGJsaW5rezUwJXtvcGFjaXR5OjB9fQouY2FyZHN7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczpyZXBlYXQoYXV0by1maXQsbWlubWF4KDE1MHB4LDFmcikpO2dhcDoxMnB4O21hcmdpbjoxOHB4IDAgMjBweH0KLmNhcmR7Ym9yZGVyOjFweCBzb2xpZCAjN2E1ZjFlO2JhY2tncm91bmQ6cmdiYSgyNTUsMTc2LDAsLjA0NSk7Ym9yZGVyLXJhZGl1czo4cHg7cGFkZGluZzoxNHB4IDEwcHg7dGV4dC1hbGlnbjpjZW50ZXJ9Ci5jYXJkIC5sYWJlbHtmb250LXNpemU6MTFweDtjb2xvcjojYTg4NDJmO3RleHQtdHJhbnNmb3JtOnVwcGVyY2FzZTtsZXR0ZXItc3BhY2luZzoycHh9Ci5jYXJkIC52YWx1ZXtmb250LXNpemU6MjdweDttYXJnaW4tdG9wOjZweDtjb2xvcjojZmZkNzZlfQouY2FyZCAudW5pdHtmb250LXNpemU6MTJweDtjb2xvcjojOGE2ZDJhO21hcmdpbi10b3A6MnB4fQp0YWJsZXt3aWR0aDoxMDAlO2JvcmRlci1jb2xsYXBzZTpjb2xsYXBzZTtmb250LXNpemU6MTMuNXB4fQp0aCx0ZHtwYWRkaW5nOjdweCA5cHg7dGV4dC1hbGlnbjpjZW50ZXI7Ym9yZGVyOjFweCBzb2xpZCAjNWM0YTFjO2NvbG9yOiNmZmIwMDB9CnRoe2JhY2tncm91bmQ6cmdiYSgyNTUsMTc2LDAsLjEpO2NvbG9yOiNmZmQ3NmU7Zm9udC1zaXplOjExLjVweDt0ZXh0LXRyYW5zZm9ybTp1cHBlcmNhc2U7bGV0dGVyLXNwYWNpbmc6MS41cHg7Zm9udC13ZWlnaHQ6NDAwfQp0aC5ncm91cHtiYWNrZ3JvdW5kOnJnYmEoMjU1LDE3NiwwLC4xNil9Ci5hcHB7Zm9udC13ZWlnaHQ6NDAwO2NvbG9yOiNmZmU2YTM7dGV4dC1hbGlnbjpsZWZ0fQouZGlye2ZvbnQtc2l6ZToxMXB4O2NvbG9yOiM4YTZkMmF9Ci5kb3due2NvbG9yOiNmZmUwOGF9Ci51cHtjb2xvcjojYzhhNDRhfQouc3lzLXJvdyB0ZHtiYWNrZ3JvdW5kOnJnYmEoMjU1LDE3NiwwLC4wNyl9Ci5zeXMtcm93IHRkLmFwcHtjb2xvcjojZmZmMmNjfQoucGVlcnN7Zm9udC1zaXplOjEwLjVweDtsaW5lLWhlaWdodDoxLjQ7bWF4LXdpZHRoOjI4MHB4O2NvbG9yOiNkNGE5NGZ9Ci5wZWVye3doaXRlLXNwYWNlOm5vcm1hbDt3b3JkLWJyZWFrOmJyZWFrLXdvcmR9Ci5wZWVyLm11dGVke2NvbG9yOiM2YjU1MjB9Ci5wb3J0c3tmb250LXNpemU6MTAuNXB4O2xpbmUtaGVpZ2h0OjEuNDtjb2xvcjojZDRhOTRmfQouaXB7Y29sb3I6IzhhNmQyYTtmb250LXNpemU6MTBweH0KLnVwZGF0ZWQsLmRpYWd7Y29sb3I6IzhhNmQyYTtmb250LXNpemU6MTEuNXB4O21hcmdpbi10b3A6MTBweDtsZXR0ZXItc3BhY2luZzouNXB4fQouZm9vdHttYXJnaW4tdG9wOjE2cHg7cGFkZGluZy10b3A6MTBweDtib3JkZXItdG9wOjFweCBkYXNoZWQgIzVjNGExYztmb250LXNpemU6MTAuNXB4O2NvbG9yOiM3YTVmMWU7bGV0dGVyLXNwYWNpbmc6MXB4O2Rpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjtmbGV4LXdyYXA6d3JhcDtnYXA6NnB4fQouZm9vdCAucmFke2NvbG9yOiNmZmQ3NmV9Cjwvc3R5bGU+PC9oZWFkPjxib2R5Pgo8ZGl2IGlkPSJzY3JlZW4iPgo8aDE+4piiIFZBVUxULVRFQyBORVRXT1JLIE1PTklUT1IgPHNwYW4gY2xhc3M9InZlciI+dl9fVkVSX188L3NwYW4+PC9oMT4KPGRpdiBjbGFzcz0ic3ViIj5QSVAtT1MgdjEuMC4yNCAmbWRhc2g7IFdBU1RFTEFORCBFRElUSU9OIDxzcGFuIGNsYXNzPSJvayI+fCBTVEFUVVM6IE9OTElORTwvc3Bhbj48c3BhbiBjbGFzcz0iY3Vyc29yIj48L3NwYW4+PC9kaXY+CjxkaXYgY2xhc3M9ImNhcmRzIj4KPGRpdiBjbGFzcz0iY2FyZCI+PGRpdiBjbGFzcz0ibGFiZWwiPlBvYmllcmFuaWU8L2Rpdj48ZGl2IGNsYXNzPSJ2YWx1ZSIgaWQ9InJ4LXJhdGUiPi08L2Rpdj48ZGl2IGNsYXNzPSJ1bml0IiBpZD0icngtcmF0ZS11Ij48L2Rpdj48L2Rpdj4KPGRpdiBjbGFzcz0iY2FyZCI+PGRpdiBjbGFzcz0ibGFiZWwiPld5c3lsYW5pZTwvZGl2PjxkaXYgY2xhc3M9InZhbHVlIiBpZD0idHgtcmF0ZSI+LTwvZGl2PjxkaXYgY2xhc3M9InVuaXQiIGlkPSJ0eC1yYXRlLXUiPjwvZGl2PjwvZGl2Pgo8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJsYWJlbCI+T2RlYnJhbm88L2Rpdj48ZGl2IGNsYXNzPSJ2YWx1ZSIgaWQ9InJ4LXRvdGFsIj4tPC9kaXY+PGRpdiBjbGFzcz0idW5pdCIgaWQ9InJ4LXRvdGFsLXUiPjwvZGl2PjwvZGl2Pgo8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJsYWJlbCI+V3lzbGFubzwvZGl2PjxkaXYgY2xhc3M9InZhbHVlIiBpZD0idHgtdG90YWwiPi08L2Rpdj48ZGl2IGNsYXNzPSJ1bml0IiBpZD0idHgtdG90YWwtdSI+PC9kaXY+PC9kaXY+CjwvZGl2Pgo8dGFibGU+Cjx0aGVhZD4KPHRyPgo8dGggcm93c3Bhbj0iMiI+QXBsaWthY2phPC90aD4KPHRoIHJvd3NwYW49IjIiPlBvbGFjemVuaWEgKElQKTwvdGg+Cjx0aCByb3dzcGFuPSIyIj5Qb3J0PC90aD4KPHRoIGNvbHNwYW49IjIiIGNsYXNzPSJncm91cCI+UHJlZGtvc2M8L3RoPgo8dGggY29sc3Bhbj0iMiIgY2xhc3M9Imdyb3VwIj5TdW1hPC90aD4KPC90cj4KPHRyPgo8dGg+UG9iaWVyYW5pZTwvdGg+PHRoPld5c3lsYW5pZTwvdGg+PHRoPlBvYmllcmFuaWU8L3RoPjx0aD5XeXN5bGFuaWU8L3RoPgo8L3RyPgo8L3RoZWFkPgo8dGJvZHkgaWQ9InJvd3MiPjwvdGJvZHk+CjwvdGFibGU+CjxkaXYgY2xhc3M9InVwZGF0ZWQiIGlkPSJ1cGRhdGVkIj48L2Rpdj4KPGRpdiBjbGFzcz0iZGlhZyIgaWQ9ImRpYWciPjwvZGl2Pgo8ZGl2IGNsYXNzPSJmb290Ij48c3Bhbj7CqSAyMDc3IFZBVUxULVRFQyBJTkRVU1RSSUVTICZtZGFzaDsgTkVUV09SSyBESVZJU0lPTjwvc3Bhbj48c3BhbiBjbGFzcz0icmFkIj7imKIgQUxMIFNZU1RFTVMgTk9NSU5BTDwvc3Bhbj48L2Rpdj4KPC9kaXY+CjxzY3JpcHQ+CmZ1bmN0aW9uIHJhdGUodil7dj0rdnx8MDtpZih2Pj0xMDQ4NTc2KXJldHVyblsodi8xMDQ4NTc2KS50b0ZpeGVkKDEpLCdNQi9zJ107aWYodj49MTAyNClyZXR1cm5bKHYvMTAyNCkudG9GaXhlZCgxKSwna0IvcyddO3JldHVyblt2LnRvRml4ZWQoMCksJ0IvcyddfQpmdW5jdGlvbiB0b3RhbCh2KXt2PSt2fHwwO2lmKHY+PTEwNzM3NDE4MjQpcmV0dXJuWyh2LzEwNzM3NDE4MjQpLnRvRml4ZWQoMiksJ0dCJ107aWYodj49MTA0ODU3NilyZXR1cm5bKHYvMTA0ODU3NikudG9GaXhlZCgxKSwnTUInXTtpZih2Pj0xMDI0KXJldHVyblsodi8xMDI0KS50b0ZpeGVkKDApLCdrQiddO3JldHVyblt2LnRvRml4ZWQoMCksJ0InXX0KZnVuY3Rpb24gcm93KG5hbWUsc3lzKXsKdmFyIHIxPXJhdGUobmFtZS5yeF9yYXRlKSxyMj1yYXRlKG5hbWUudHhfcmF0ZSksdDE9dG90YWwobmFtZS5yeF90b3RhbCksdDI9dG90YWwobmFtZS50eF90b3RhbCk7CnZhciBwZWVycz0obmFtZS5wZWVyc3x8W10pLnNsaWNlKDAsNCk7CnZhciBpcEh0bWwsIHBvcnRIdG1sOwppZihwZWVycy5sZW5ndGgpewogIGlwSHRtbD1wZWVycy5tYXAoZnVuY3Rpb24ocCl7cmV0dXJuICc8ZGl2IGNsYXNzPSJwZWVyIj4nKyhwLmhvc3Q/cC5ob3N0Kyc8YnI+PHNwYW4gY2xhc3M9ImlwIj4nK3AuaXArJzwvc3Bhbj4nOnAuaXApKyc8L2Rpdj4nO30pLmpvaW4oJycpOwogIHBvcnRIdG1sPXBlZXJzLm1hcChmdW5jdGlvbihwKXtyZXR1cm4gJzxkaXYgY2xhc3M9InBlZXIiPicrcC5wb3J0Kyc8L2Rpdj4nO30pLmpvaW4oJycpOwp9ZWxzZXtpcEh0bWw9JzxkaXYgY2xhc3M9InBlZXIgbXV0ZWQiPi08L2Rpdj4nO3BvcnRIdG1sPSc8ZGl2IGNsYXNzPSJwZWVyIG11dGVkIj4tPC9kaXY+Jzt9CnJldHVybiAnPHRyJysoc3lzPycgY2xhc3M9InN5cy1yb3ciJzonJykrJz48dGQgY2xhc3M9ImFwcCI+JytuYW1lLm5hbWUrJzwvdGQ+JworJzx0ZCBjbGFzcz0icGVlcnMiPicraXBIdG1sKyc8L3RkPicKKyc8dGQgY2xhc3M9InBvcnRzIj4nK3BvcnRIdG1sKyc8L3RkPicKKyc8dGQgY2xhc3M9ImRvd24iPicrcjFbMF0rJyAnK3IxWzFdKyc8L3RkPjx0ZCBjbGFzcz0idXAiPicrcjJbMF0rJyAnK3IyWzFdKyc8L3RkPicKKyc8dGQgY2xhc3M9ImRvd24iPicrdDFbMF0rJyAnK3QxWzFdKyc8L3RkPjx0ZCBjbGFzcz0idXAiPicrdDJbMF0rJyAnK3QyWzFdKyc8L3RkPjwvdHI+JzsKfQpmdW5jdGlvbiByZW5kZXIoKXsKUHJvbWlzZS5hbGwoWwpmZXRjaCgnL2FwaS90b3RhbHMnKS50aGVuKGZ1bmN0aW9uKHIpe3JldHVybiByLmpzb24oKX0pLApmZXRjaCgnL2FwaS9zdGF0cycpLnRoZW4oZnVuY3Rpb24ocil7cmV0dXJuIHIuanNvbigpfSksCmZldGNoKCcvYXBpL2RpYWcnKS50aGVuKGZ1bmN0aW9uKHIpe3JldHVybiByLmpzb24oKX0pLmNhdGNoKGZ1bmN0aW9uKCl7cmV0dXJuIHt9fSkKXSkudGhlbihmdW5jdGlvbihkKXsKdmFyIHRvdD1kWzBdfHx7fSwgc3Q9ZFsxXXx8e30sIGRpYWc9ZFsyXXx8c3QuZGlhZ3x8e307CnZhciByMT1yYXRlKHRvdC5yeF9yYXRlfHwwKSwgcjI9cmF0ZSh0b3QudHhfcmF0ZXx8MCksIHQxPXRvdGFsKHRvdC5yeF90b3RhbHx8MCksIHQyPXRvdGFsKHRvdC50eF90b3RhbHx8MCk7CmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdyeC1yYXRlJykudGV4dENvbnRlbnQ9cjFbMF07IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdyeC1yYXRlLXUnKS50ZXh0Q29udGVudD1yMVsxXTsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3R4LXJhdGUnKS50ZXh0Q29udGVudD1yMlswXTsgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3R4LXJhdGUtdScpLnRleHRDb250ZW50PXIyWzFdOwpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgncngtdG90YWwnKS50ZXh0Q29udGVudD10MVswXTsgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3J4LXRvdGFsLXUnKS50ZXh0Q29udGVudD10MVsxXTsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3R4LXRvdGFsJykudGV4dENvbnRlbnQ9dDJbMF07IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd0eC10b3RhbC11JykudGV4dENvbnRlbnQ9dDJbMV07CnZhciBodG1sPScnLCBzeXM9c3Quc3lzdGVtLCBhcHBzPXN0LmFwcHN8fFtdOwppZihzeXMpe2h0bWwrPXJvdyhzeXMsdHJ1ZSl9CmFwcHMuZm9yRWFjaChmdW5jdGlvbihhKXtodG1sKz1yb3coYSxmYWxzZSl9KTsKaWYoIWFwcHMubGVuZ3RoKSBodG1sKz0nPHRyPjx0ZCBjb2xzcGFuPSI3Ij5UcndhIHBpZXJ3c3p5IHBvbWlhci4uLjwvdGQ+PC90cj4nOwpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgncm93cycpLmlubmVySFRNTD1odG1sOwp2YXIgdHM9c3QudHM/bmV3IERhdGUoc3QudHMqMTAwMCkudG9Mb2NhbGVUaW1lU3RyaW5nKCdwbC1QTCcpOictJzsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3VwZGF0ZWQnKS50ZXh0Q29udGVudD0nQWt0dWFsaXphY2phOiAnK3RzOwpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZGlhZycpLnRleHRDb250ZW50PSdEaWFnOiBkb2NrZXI9JysoZGlhZy5kb2NrZXJfb2s/J09LJzonTk8nKSsnIG1ldGhvZD0nKyhkaWFnLm1ldGhvZHx8Jz8nKSsnIG1hcHBlZD0nKyhkaWFnLm1hcHBlZHx8MCkrJyB1bm1hcHBlZF92ZXRoPScrKGRpYWcudW5tYXBwZWRfdmV0aHx8MCkrKGRpYWcuZXJyb3I/KCcgZXJyPScrZGlhZy5lcnJvcik6JycpOwp9KS5jYXRjaChmdW5jdGlvbigpe30pOwp9CnJlbmRlcigpOyBzZXRJbnRlcnZhbChyZW5kZXIsMTAwMCk7Cjwvc2NyaXB0PjwvYm9keT48L2h0bWw+Cg=='
-        ).decode('utf-8').replace('__VER__', VERSION)
-
-        def fr(bps):
-            if bps >= 1048576: return ('%.1f' % (bps/1048576.0), 'MB/s')
-            if bps >= 1024: return ('%.1f' % (bps/1024.0), 'kB/s')
-            return ('%.0f' % bps, 'B/s')
-
-        def fb(n):
-            if n >= 1073741824: return ('%.1f' % (n/1073741824.0), 'GB')
-            if n >= 1048576: return ('%.1f' % (n/1048576.0), 'MB')
-            if n >= 1024: return ('%.0f' % (n/1024.0), 'kB')
-            return (str(int(n)), 'B')
-
-        def loadj(path):
-            try:
-                with open(path) as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-
-        def totals():
-            """Single source of truth: system + all apps summed (used by widget AND www cards)."""
-            a = loadj(APP_STATS)
-            apps = a.get('apps', []) or []
-            sysr = a.get('system', {}) or {}
-            def _f(x):
-                try:
-                    return float(x or 0)
-                except Exception:
-                    return 0.0
-            return {
-                'rx_rate': _f(sysr.get('rx_rate')) + sum(_f(x.get('rx_rate')) for x in apps),
-                'tx_rate': _f(sysr.get('tx_rate')) + sum(_f(x.get('tx_rate')) for x in apps),
-                'rx_total': _f(sysr.get('rx_total')) + sum(_f(x.get('rx_total')) for x in apps),
-                'tx_total': _f(sysr.get('tx_total')) + sum(_f(x.get('tx_total')) for x in apps),
-            }
-
-        class H(BaseHTTPRequestHandler):
-            def _json(self, obj):
-                body = json.dumps(obj).encode()
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Content-Length', str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def do_GET(self):
-                if self.path == '/widgets/network':
-                    s = totals()
-                    rv, ru = fb(s.get('rx_total', 0)); tv, tu = fb(s.get('tx_total', 0))
-                    rrv, rru = fr(s.get('rx_rate', 0)); trv, tru = fr(s.get('tx_rate', 0))
-                    self._json({'type': 'four-stats', 'refresh': '5s', 'link': '', 'items': [
-                        {'title': 'Pobieranie', 'text': rrv, 'subtext': rru},
-                        {'title': 'Wysylanie', 'text': trv, 'subtext': tru},
-                        {'title': 'Odebrano', 'text': rv, 'subtext': ru},
-                        {'title': 'Wyslano', 'text': tv, 'subtext': tu}]})
-                elif self.path == '/api/totals':
-                    self._json(totals())
-                elif self.path == '/api/stats':
-                    self._json(loadj(APP_STATS))
-                elif self.path == '/api/diag':
-                    d = loadj(DIAG)
-                    if not d:
-                        d = loadj(APP_STATS).get('diag', {})
-                    self._json(d)
-                elif self.path in ('/', '/index.html'):
-                    body = HTML.encode('utf-8')
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'text/html; charset=utf-8')
-                    self.send_header('Content-Length', str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-
-            def log_message(self, *a):
-                pass
-
-        HTTPServer(('0.0.0.0', PORT), H).serve_forever()
-        PYEOF
-        exec python3 /data/widget_server.py
+        python3 -c "import base64,gzip,os;os.makedirs('/app',exist_ok=True);open('/app/hermes_server.py','wb').write(gzip.decompress(base64.b64decode('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')));print('[netmon] server code deployed')" && exec python3 /app/hermes_server.py
