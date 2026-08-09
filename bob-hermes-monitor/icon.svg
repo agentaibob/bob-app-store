@@ -1,47 +1,50 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none">
-  <!-- 
-    Hermes Monitor — ikona czarno-biała v1.2.0
-    Monochromatyczny kaduceusz Hermesa: skrzydlaty kij ze splecionymi wężami.
-    Kolor: currentColor (dziedziczony z kontekstu — biały na ciemnym tle, czarny na jasnym).
-    Przezroczyste tło — współgra z dowolnym kolorem tła (jasny/ciemny motyw).
-  -->
-  
-  <!-- Tło: subtelny ciemny prostokąt, tylko jeśli potrzeba kontrastu; przezroczysty domyślnie -->
-  <!-- <rect x="2" y="2" width="96" height="96" rx="24" fill="#0B1121" opacity="0.9"/> -->
-  
-  <!-- Skrzydła (u góry) — prosty geometryczny kształt -->
-  <g stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" fill="none">
-    <!-- Lewe skrzydło -->
-    <path d="M44 32 Q36 18 26 14"/>
-    <path d="M44 32 Q38 20 30 16"/>
-    <path d="M44 32 Q40 22 34 18"/>
-    <!-- Prawe skrzydło -->
-    <path d="M56 32 Q64 18 74 14"/>
-    <path d="M56 32 Q62 20 70 16"/>
-    <path d="M56 32 Q60 22 66 18"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Hermes Monitor — oparty na kaduceuszu Hermes Agent + elementy monitoringu -->
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="35%" r="85%">
+      <stop offset="0%" stop-color="#15233c"/>
+      <stop offset="100%" stop-color="#0a101f"/>
+    </radialGradient>
+    <linearGradient id="cad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#7fb3ff"/>
+      <stop offset="100%" stop-color="#3b6fb8"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="8" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Tło -->
+  <rect x="8" y="8" width="496" height="496" rx="88" fill="url(#bg)"/>
+
+  <!-- Kaduceusz Hermesa (laska + skrzydła + węże) -->
+  <g stroke="url(#cad)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- Skrzydła u góry -->
+    <path d="M180 150 Q115 105 80 95"/>
+    <path d="M180 150 Q125 118 95 112"/>
+    <path d="M180 150 Q135 130 110 128"/>
+    <path d="M332 150 Q397 105 432 95"/>
+    <path d="M332 150 Q387 118 417 112"/>
+    <path d="M332 150 Q377 130 402 128"/>
+    <!-- Centralna laska -->
+    <line x1="256" y1="150" x2="256" y2="340"/>
+    <!-- Kula na szczycie -->
+    <circle cx="256" cy="132" r="26" fill="url(#cad)" stroke="none"/>
   </g>
-  
-  <!-- Centralny kij (laska) -->
-  <line x1="50" y1="28" x2="50" y2="82" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
-  
-  <!-- Kula na szczycie laski -->
-  <circle cx="50" cy="26" r="4" fill="currentColor" opacity="0.9"/>
-  
-  <!-- Węże splecione wokół laski — dwie symetryczne krzywe -->
-  <g stroke="currentColor" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round" fill="none">
-    <!-- Lewy wąż (w dół) -->
-    <path d="M46 36 Q36 45 46 54 Q54 60 46 68 Q38 74 44 82" opacity="0.85"/>
-    <!-- Prawy wąż (w dół) — lustrzane odbicie -->
-    <path d="M54 36 Q64 45 54 54 Q46 60 54 68 Q62 74 56 82" opacity="0.85"/>
+  <!-- Splecione węże wokół laski -->
+  <g stroke="url(#cad)" stroke-width="12" fill="none" opacity="0.9">
+    <path d="M236 170 C190 200 322 230 236 260 C190 280 322 310 236 330"/>
+    <path d="M276 170 C322 200 190 230 276 260 C322 280 190 310 276 330"/>
   </g>
-  
-  <!-- Głowy węży (małe trójkąty) -->
-  <polygon points="42,80 38,86 46,82" fill="currentColor" opacity="0.8"/>
-  <polygon points="58,80 62,86 54,82" fill="currentColor" opacity="0.8"/>
-  
-  <!-- Subtelne oznaczenie "monitora" — małe okręgi jak punkty danych przy podstawie -->
-  <circle cx="38" cy="90" r="1.5" fill="currentColor" opacity="0.5"/>
-  <circle cx="46" cy="90" r="1.5" fill="currentColor" opacity="0.7"/>
-  <circle cx="54" cy="90" r="1.5" fill="currentColor" opacity="0.7"/>
-  <circle cx="62" cy="90" r="1.5" fill="currentColor" opacity="0.5"/>
+
+  <!-- Element monitoringu: krzywa EKG/Pulse -->
+  <polyline points="96,392 150,392 172,340 196,420 224,392 280,392 304,344 328,416 356,392 416,392"
+            fill="none" stroke="#22c55e" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"
+            filter="url(#glow)"/>
+
+  <!-- Kropki statusu (monitoring online) -->
+  <circle cx="120" cy="462" r="16" fill="#22c55e"/>
+  <circle cx="256" cy="462" r="16" fill="#38bdf8"/>
+  <circle cx="392" cy="462" r="16" fill="#f59e0b"/>
 </svg>
