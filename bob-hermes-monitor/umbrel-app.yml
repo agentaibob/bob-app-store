@@ -4,12 +4,12 @@ name: Hermes Monitor
 tagline: Live status, tokens and cron health for Hermes Agent
 icon: https://raw.githubusercontent.com/agentaibob/bob-app-store/main/bob-hermes-monitor/icon.svg
 category: Utilities
-version: "1.6.0"
+version: "1.7.0"
 port: 8126
 description: >-
   Dashboard i widget dla Hermes Agent: status gateway i profili, tokeny i
-  koszty, zadania cron, tablica kanban, alerty, zdrowie kluczy API i logi.
-  Czyta dane Hermesa z katalogu danych wyłącznie w trybie read-only. Klucze API Klucze API
+  koszty, zadania cron, tablica kanban, zdrowie kluczy API i logi.
+  Czyta dane Hermesa z katalogu danych wyłącznie w trybie read-only. Klucze API
   pokazywane tylko po nazwach zmiennych, nigdy po wartościach.
 developer: Bob
 website: https://github.com/agentaibob/bob-app-store
@@ -20,23 +20,20 @@ defaultUsername: ""
 defaultPassword: ""
 widgets:
   - id: "hermes"
-    type: "four-stats"
+    type: "three-stats"
     refresh: "5s"
     endpoint: "server:8126/widgets/hermes"
     link: ""
     example:
-      type: "four-stats"
+      type: "three-stats"
       link: ""
       items:
-        - title: "Profile online"
+        - icon: "brain"
           text: "7/7"
-          subtext: "aktywne"
-        - title: "Tokeny dziś"
-          text: "1.2M"
-          subtext: "input"
-        - title: "Koszt dziś"
-          text: "0.42"
-          subtext: "USD"
-        - title: "Alerty"
-          text: "3"
-          subtext: "aktywne"
+          subtext: "Profile online"
+        - icon: "coin"
+          text: "11.0M"
+          subtext: "Tokeny łącznie"
+        - icon: "currency-dollar"
+          text: "3.91"
+          subtext: "Koszty łącznie (est.)"
