@@ -50,7 +50,7 @@ services:
           HERMES_DATA = os.environ.get("HERMES_ROOT", "/hermes-data")
           PROFILES_ROOT = os.path.join(HERMES_DATA, "profiles")
 
-          APP_VERSION = "1.8.0"
+          APP_VERSION = "1.9.0"
 
           STATUS_POLL_SECONDS = 10
           METRICS_POLL_SECONDS = 30
@@ -142,41 +142,68 @@ services:
               conn.close()
 
           # --- Kolektor ----------------------------------------------------------------
+          def _get_uptime_sec(start_time):
+              """start_time w gateway_state.json to pole 22 /proc/<pid>/stat (clock ticks od
+              bootu), NIE epoch. Przelicz na sekundy pracy procesu (HZ + uptime)."""
+              if start_time is None:
+                  return None
+              try:
+                  hz = os.sysconf("SC_CLK_TCK") or 100
+                  up_ticks = float(open("/proc/uptime").read().split()[0]) * hz
+                  sec = (up_ticks - float(start_time)) / hz
+                  return max(0.0, sec)
+              except Exception:
+                  return None
+
           def _parse_gateway_state(profile):
               home = _get_profile_home(profile)
               state_path = os.path.join(home, "gateway_state.json")
               data = _read_json(state_path) or {}
               gw_state = data.get("gateway_state") or data.get("state", "unknown")
-              platforms = data.get("platforms") or {}
-              plat_list = {}
-              for name, info in platforms.items():
-                  if isinstance(info, dict):
-                      plat_list[name] = {"state": info.get("state", "unknown")}
+              pid = data.get("pid")
+              start_time = data.get("start_time")
+              uptime = _get_uptime_sec(start_time)
+              # Wiek danych (sekundy od updated_at)
+              age_seconds = None
+              updated_ts = data.get("updated_at")
+              if updated_ts:
+                  try:
+                      dt = datetime.fromisoformat(str(updated_ts).replace("Z", "+00:00"))
+                      age_seconds = time.time() - dt.timestamp()
+                  except Exception:
+                      age_seconds = None
+              # Platformy z zachowaniem error_code i error_message
+              platforms_in = data.get("platforms", {}) or {}
+              platforms_out = []
+              for name, pinfo in platforms_in.items():
+                  if isinstance(pinfo, dict):
+                      platforms_out.append({
+                          "name": name,
+                          "state": pinfo.get("state", "unknown"),
+                          "error_code": pinfo.get("error_code"),
+                          "error_message": pinfo.get("error_message"),
+                          "updated_at": _ts_to_iso(pinfo.get("updated_at")),
+                      })
                   else:
-                      plat_list[name] = {"state": "unknown"}
+                      platforms_out.append({
+                          "name": name, "state": str(pinfo),
+                          "error_code": None, "error_message": None, "updated_at": None,
+                      })
               return {
                   "profile": profile,
                   "running": gw_state == "running",
-                  "pid": data.get("pid"),
+                  "pid": pid,
                   "state": gw_state,
-                  "platforms": plat_list,
+                  "desired_state": data.get("desired_state"),
+                  "start_time": start_time,
+                  "uptime": uptime,
+                  "age_seconds": age_seconds,
                   "exit_reason": data.get("exit_reason"),
                   "restart_requested": data.get("restart_requested", False),
                   "active_agents": data.get("active_agents", 0),
-                  "updated_at": _ts_to_iso(data.get("updated_at")),
+                  "updated_at": _ts_to_iso(updated_ts),
+                  "platforms": platforms_out,
               }
-
-          def _get_signal_bridge():
-              """Status zewnętrznego mostka Signal (watchdog na Raspberry Pi).
-              Zapisywany do HERMES_DATA/scripts/.signal_bridge_state (ok|down|brak)."""
-              path = os.path.join(HERMES_DATA, "scripts", ".signal_bridge_state")
-              state = "unknown"
-              try:
-                  if os.path.exists(path):
-                      state = open(path).read().strip().lower() or "unknown"
-              except Exception:
-                  state = "unknown"
-              return {"state": state, "up": state == "ok"}
 
           def _parse_cron_ticker(profile):
               home = _get_profile_home(profile)
@@ -517,6 +544,10 @@ services:
                       env_names = _read_env_names(profile)
                       errors_log = _read_log_summary(profile, "errors.log", 1)
                       agent_log = _read_log_summary(profile, "agent.log", 1)
+                      # Wzbogać obiekt gateway: aliveness cron-tickera + liczba błędów 1h
+                      gw["cron_alive"] = ticker.get("alive", False)
+                      gw["cron_heartbeat_age_seconds"] = ticker.get("heartbeat_age_seconds")
+                      gw["errors_1h"] = errors_log.get("errors", 0)
                       profiles_data.append({
                           "profile": profile, "home": str(home),
                           "gateway": gw, "cron_ticker": ticker,
@@ -533,7 +564,6 @@ services:
 
               snapshot = {
                   "ts": time.time(), "ts_iso": _ts_to_iso(time.time()),
-                  "signal_bridge": _get_signal_bridge(),
                   "summary": {
                       "profiles_total": len(profiles_data),
                       "profiles_running": len(active),
@@ -573,17 +603,17 @@ services:
                   time.sleep(STATUS_POLL_SECONDS)
 
           # --- Widget ----------------------------------------------------------------
-          def _fmt_tokens(n):
-              n = n or 0
-              if n >= 1_000_000:
-                  return f"{n/1_000_000:.1f}M"
-              if n >= 1_000:
-                  return f"{n/1_000:.1f}k"
-              return str(int(n))
-
           def widget_data():
               snap = get_snapshot() or {}
               summary = snap.get("summary", {})
+
+              def _fmt_tokens(n):
+                  n = n or 0
+                  if n >= 1_000_000:
+                      return f"{n/1_000_000:.1f}M"
+                  if n >= 1_000:
+                      return f"{n/1_000:.1f}k"
+                  return str(int(n))
 
               # Tokeny + koszty LĄCZNIE agregowane po wszystkich profilach (30 dni)
               total_tokens_in = 0
@@ -704,7 +734,6 @@ services:
                           snap = get_snapshot()
                       self._json({
                           "ts": snap.get("ts_iso") if snap else None,
-                          "signal_bridge": snap.get("signal_bridge") if snap else None,
                           "summary": snap.get("summary") if snap else {},
                           "profiles": [
                               {"profile": p["profile"], "home": p["home"],
