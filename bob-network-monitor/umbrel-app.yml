@@ -4,7 +4,7 @@ name: Network Monitor
 tagline: Real-time system and per-app network traffic
 icon: https://raw.githubusercontent.com/agentaibob/bob-app-store/main/bob-network-monitor/icon.svg
 category: Utilities
-version: "1.0.27"
+version: "1.0.28"
 port: 8124
 description: >-
   Real-time network traffic monitor for the entire umbrelOS system.
