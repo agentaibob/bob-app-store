@@ -1,50 +1,45 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <!-- Hermes Monitor — oparty na kaduceuszu Hermes Agent + elementy monitoringu -->
+  <!-- Hermes Monitor — ikona wzorowana na kwadratowym kaduceuszu Hermes Agent
+       + jeden element monitoringu: puls EKG w dolnej części. -->
   <defs>
-    <radialGradient id="bg" cx="50%" cy="35%" r="85%">
-      <stop offset="0%" stop-color="#15233c"/>
-      <stop offset="100%" stop-color="#0a101f"/>
-    </radialGradient>
-    <linearGradient id="cad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#7fb3ff"/>
-      <stop offset="100%" stop-color="#3b6fb8"/>
+    <linearGradient id="frame" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2a6db5"/>
+      <stop offset="100%" stop-color="#14345c"/>
     </linearGradient>
-    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
-      <feGaussianBlur stdDeviation="8" result="b"/>
-      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
+    <linearGradient id="rod" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#e8f2ff"/>
+      <stop offset="100%" stop-color="#a8c8ee"/>
+    </linearGradient>
   </defs>
 
-  <!-- Tło -->
-  <rect x="8" y="8" width="496" height="496" rx="88" fill="url(#bg)"/>
+  <!-- Ramka kwadratowa z zaokrąglonymi rogami (jak załączona ikona Hermes) -->
+  <rect x="16" y="16" width="480" height="480" rx="104" fill="url(#frame)"/>
 
-  <!-- Kaduceusz Hermesa (laska + skrzydła + węże) -->
-  <g stroke="url(#cad)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round" fill="none">
-    <!-- Skrzydła u góry -->
-    <path d="M180 150 Q115 105 80 95"/>
-    <path d="M180 150 Q125 118 95 112"/>
-    <path d="M180 150 Q135 130 110 128"/>
-    <path d="M332 150 Q397 105 432 95"/>
-    <path d="M332 150 Q387 118 417 112"/>
-    <path d="M332 150 Q377 130 402 128"/>
-    <!-- Centralna laska -->
-    <line x1="256" y1="150" x2="256" y2="340"/>
-    <!-- Kula na szczycie -->
-    <circle cx="256" cy="132" r="26" fill="url(#cad)" stroke="none"/>
-  </g>
-  <!-- Splecione węże wokół laski -->
-  <g stroke="url(#cad)" stroke-width="12" fill="none" opacity="0.9">
-    <path d="M236 170 C190 200 322 230 236 260 C190 280 322 310 236 330"/>
-    <path d="M276 170 C322 200 190 230 276 260 C322 280 190 310 276 330"/>
+  <!-- Kaduceusz Hermesa: skrzydła u góry -->
+  <g stroke="url(#rod)" stroke-width="26" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- lewe skrzydło -->
+    <path d="M225 168 Q182 110 128 96"/>
+    <path d="M225 168 Q193 122 145 112"/>
+    <path d="M225 168 Q204 133 162 128"/>
+    <!-- prawe skrzydło -->
+    <path d="M287 168 Q330 110 384 96"/>
+    <path d="M287 168 Q319 122 367 112"/>
+    <path d="M287 168 Q308 133 350 128"/>
   </g>
 
-  <!-- Element monitoringu: krzywa EKG/Pulse -->
-  <polyline points="96,392 150,392 172,340 196,420 224,392 280,392 304,344 328,416 356,392 416,392"
-            fill="none" stroke="#22c55e" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"
-            filter="url(#glow)"/>
+  <!-- Centralny kij (laska) -->
+  <line x1="256" y1="150" x2="256" y2="356" stroke="url(#rod)" stroke-width="30" stroke-linecap="round"/>
 
-  <!-- Kropki statusu (monitoring online) -->
-  <circle cx="120" cy="462" r="16" fill="#22c55e"/>
-  <circle cx="256" cy="462" r="16" fill="#38bdf8"/>
-  <circle cx="392" cy="462" r="16" fill="#f59e0b"/>
+  <!-- Kula na szczycie laski -->
+  <circle cx="256" cy="132" r="34" fill="url(#rod)"/>
+
+  <!-- Węże splecione wokół laski -->
+  <g stroke="url(#rod)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M226 196 C176 230 336 268 226 308 C196 322 316 348 226 370"/>
+    <path d="M286 196 C336 230 176 268 286 308 C316 322 196 348 286 370"/>
+  </g>
+
+  <!-- Element monitoringu: puls EKG w dolnej części ikony -->
+  <polyline points="132,428 208,428 236,392 264,464 294,428 380,428"
+            fill="none" stroke="#22c55e" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
