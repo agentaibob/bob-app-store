@@ -19,7 +19,17 @@ services:
       #  mounting that made the app read an empty dir -> 0 profiles).
       # :ro = read-only safety invariant (server must never modify hermes data).
       - /home/umbrel/umbrel/app-data/hermes-agent/data/hermes:/hermes-data:ro
-      # Server code mounted as file (heredoc was too long, exceeded ARG_MAX)
-      - ./hermes_server.py:/app/hermes_server.py:ro
-      - ./icon.svg:/app/icon.svg:ro
-    command: ["python3", "/app/hermes_server.py"]
+    command:
+      - /bin/sh
+      - -c
+      - |
+        python3 -c "
+        import urllib.request, os
+        url = 'https://raw.githubusercontent.com/agentaibob/bob-app-store/main/bob-hermes-monitor/hermes_server.py'
+        dest = '/app/hermes_server.py'
+        os.makedirs('/app', exist_ok=True)
+        with urllib.request.urlopen(url) as r:
+            with open(dest, 'wb') as f:
+                f.write(r.read())
+        print('[hermes-monitor] Downloaded server code from GitHub')
+        " && exec python3 /app/hermes_server.py
