@@ -4,7 +4,7 @@ name: Hermes Monitor
 tagline: Live status, tokens and cron health for Hermes Agent
 icon: https://raw.githubusercontent.com/agentaibob/bob-app-store/main/bob-hermes-monitor/icon.svg
 category: Utilities
-version: "1.13.12"
+version: "1.13.13"
 port: 8126
 description: >-
   Dashboard i widget dla Hermes Agent: status gateway i profili, tokeny i
