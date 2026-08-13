@@ -22,7 +22,7 @@ services:
   app_proxy:
     environment:
       # Format: <app-id>_<service>_1  (nazwa kontenera usługi `jarvis`)
-      APP_HOST: jarvis-voice_jarvis_1
+      APP_HOST: bob-jarvis-voice_jarvis_1
       APP_PORT: 8765
 
   jarvis:
