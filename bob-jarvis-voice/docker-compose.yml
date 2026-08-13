@@ -60,10 +60,12 @@ services:
       start_period: 40s
 
 networks:
-  # Sieć apki Hermes musi istnieć przed startem JARVIS (dependencies w manifeście).
+  # UmbrelOS wspólna sieć — all apps share umbrel_main_network, Hermes
+  # (hermes-agent_web_1) siedzi na niej (10.21.0.19). JARVIS dołącza tam,
+  # żeby sięgnąć API Hermesa po nazwie kontenera.
   hermes:
     external: true
-    name: hermes-agent_default
+    name: umbrel_main_network
 
 volumes:
   # Named volume — magazyn trwałości apki (config, logi, sesje, certy, .env).
