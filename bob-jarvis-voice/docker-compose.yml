@@ -32,7 +32,10 @@ services:
     restart: on-failure
     stop_grace_period: 1m
     init: true
-    user: "1000:1000"
+    # Run as root: the named data volume (jarvis-voice_jarvis-data) is
+    # root-owned on Umbrel, and entrypoint must be able to mkdir /opt/data/config
+    # on first boot. Running as uid 1000 -> "Permission denied" -> restart loop.
+    user: root
     # rootfs read-only — cały zapis idzie tylko na named volume /opt/data.
     read_only: true
     tmpfs:
