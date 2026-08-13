@@ -1,0 +1,71 @@
+version: "3.8"
+
+# JARVIS Voice Assistant — apka Umbrel (wspólny docker network z hermes-agent).
+#
+# TRWAŁOŚĆ: NAMED VOLUME `jarvis-data` (config, logi, certy, .env) montowany
+# pod /opt/data — serwer czyta/wpisuje dane z $JARVIS_DATA_DIR (ustawione w
+# obrazie server/Dockerfile). Docker inicjalizuje nazwany wolumen treścią z
+# obrazu przy pierwszym montażu, a entrypoint przesiada domyślny serwer.yaml.
+#
+# HARDENING (karta C19): read-only rootfs, cap_drop: ALL, no-new-privileges,
+# brak /var/run/docker.sock, tmpfs na /tmp. Sekrety NIE w obrazie — w .env na
+# wolumenie (patrz .env.example).
+#
+# SIEC: JARVIS dołącza do istniejącej sieci apki Hermes przez `external: true`
+# (name: hermes-agent_default) i łączy się z API po nazwie kontenera
+# http://hermes-agent_web_1:8642. Port 8642 NIE jest publikowany na LAN.
+# Warunek: apka hermes-agent musi być zainstalowana i uruchomiona PRZED tą.
+
+services:
+  # Umbrel app-proxy: serwuje HUD + WebSocket audio na umbrel.local:<port>
+  # z TLS i auth Umbrel (Obiekt/stan umbrel). APP_PORT == port HUD (8765).
+  app_proxy:
+    environment:
+      # Format: <app-id>_<service>_1  (nazwa kontenera usługi `jarvis`)
+      APP_HOST: jarvis-voice_jarvis_1
+      APP_PORT: 8765
+
+  jarvis:
+    # Obraz budowany z server/Dockerfile (kontekst server/) i wypychany do
+    # rejestru — patrz docs/RELEASE.md krok A. Stąd adres bez `build:`.
+    image: ghcr.io/agentaibob/jarvis-voice:0.1.1
+    restart: on-failure
+    stop_grace_period: 1m
+    init: true
+    user: "1000:1000"
+    # rootfs read-only — cały zapis idzie tylko na named volume /opt/data.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      # NAMED VOLUME — trwałość apki (zamiast bind mounta).
+      - jarvis-data:/opt/data
+    environment:
+      # Serwer czyta config/logi z $JARVIS_DATA_DIR (ustawione w obrazie).
+      HERMES_BASE_URL: "http://hermes-agent_web_1:8642"  # wspólna sieć docker
+      # Opcjonalny dodatkowy port HUD (direct TLS z certami w /opt/data/certs):
+      # JARVIS_HUD_PORT: "8766"
+    networks:
+      - default
+      - hermes          # wspólna sieć z apką hermes-agent
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;r=urllib.request.urlopen('http://127.0.0.1:8765/hud/',timeout=4);exit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+networks:
+  # Sieć apki Hermes musi istnieć przed startem JARVIS (dependencies w manifeście).
+  hermes:
+    external: true
+    name: hermes-agent_default
+
+volumes:
+  # Named volume — magazyn trwałości apki (config, logi, sesje, certy, .env).
+  jarvis-data:
+    name: jarvis-voice_jarvis-data
