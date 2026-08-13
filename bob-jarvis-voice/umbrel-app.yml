@@ -25,15 +25,7 @@ description: >-
 developer: Bob
 website: https://github.com/agentaibob/bob-app-store
 submitter: Tomek
-submission: ""
-repo: https://github.com/agentaibob/bob-app-store
-support: https://github.com/agentaibob/bob-app-store/issues
-gallery: []
-releaseNotes: >-
-  Wersja 0.1.1: branding B.O.B. — nowe logo aplikacji Umbrel oraz favicon,
-  ikony PWA i znak startowy HUD.
-dependencies:
-  - hermes-agent
+dependencies: []
 path: ""
 defaultUsername: ""
 defaultPassword: ""
