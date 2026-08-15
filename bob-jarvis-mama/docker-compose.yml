@@ -18,7 +18,7 @@ services:
       APP_PORT: 8765
 
   jarvis:
-    image: ghcr.io/agentaibob/jarvis-voice:0.1.4
+    image: ghcr.io/agentaibob/jarvis-mama:0.1.5-fred
     restart: on-failure
     stop_grace_period: 1m
     init: true
