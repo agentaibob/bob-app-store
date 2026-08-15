@@ -1,0 +1,33 @@
+manifestVersion: 1
+id: bob-jarvis-mama
+name: JARVIS Mama
+tagline: Osobny asystent głosowy Danki (profil danka) dla Hermes Agent
+icon: https://raw.githubusercontent.com/agentaibob/bob-app-store/main/bob-jarvis-mama/icon.svg
+category: AI
+version: "0.1.4"
+port: 8765
+description: >-
+  Druga, osobna instancja JARVIS-a (ten sam obraz co JARVIS główny), skierowana
+  wyłącznie do profilu Hermes "danka" (Mama). Działa w trybie pojedyńczego
+  profilu — brak listy profili, cała rozmowa (czat i głos) idzie bezpośrednio do
+  profilu Danka przez jej API server (hermes-agent_web_1:8644).
+
+
+  Osobny token logowania, osobny certyfikat i osobny wolumen danych — użytkownik
+  Mamy widzi tylko swojego asystenta, bez możliwości wybrania innego profilu.
+
+
+  Wymaga: apki Hermes Agent zainstalowanej ORAZ włączonego własnego API servera
+  na profilu danka (API_SERVER_PORT=8644). LAN only — nie wystawiaj do internetu.
+
+
+  Sekrety (JARVIS_HUD_TOKEN, API_SERVER_KEY) konfiguruje się w pliku .env na
+  named volume apki (/opt/data/.env). Serwer nie startuje bez tych dwóch
+  wartości (fail-closed).
+developer: Bob
+website: https://github.com/agentaibob/bob-app-store
+submitter: Tomek
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""

@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="70%">
+      <stop offset="0%" stop-color="#1a1a3a"/>
+      <stop offset="100%" stop-color="#05050f"/>
+    </radialGradient>
+    <radialGradient id="core" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ff9ad5"/>
+      <stop offset="60%" stop-color="#ff4fa3"/>
+      <stop offset="100%" stop-color="#b31273"/>
+    </radialGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="256" height="256" fill="url(#bg)"/>
+
+  <!-- zewnętrzny pierścień HUD -->
+  <circle cx="128" cy="128" r="104" fill="none" stroke="#ff9ad5" stroke-width="5" opacity="0.5"/>
+  <circle cx="128" cy="128" r="96"  fill="none" stroke="#ff6fbe" stroke-width="3" opacity="0.9"
+          stroke-dasharray="4 10"/>
+
+  <!-- serce (profil Danka) -->
+  <g filter="url(#glow)">
+    <path fill="url(#core)"
+          d="M128 196 C 96 168, 62 144, 62 108 C 62 84, 82 66, 106 66 C 119 66, 125 74, 128 84 C 131 74, 137 66, 150 66 C 174 66, 194 84, 194 108 C 194 144, 160 168, 128 196 Z"/>
+  </g>
+
+  <!-- punkt-y orbit -->
+  <circle cx="128" cy="24"  r="4" fill="#ff9ad5"/>
+  <circle cx="224" cy="128" r="4" fill="#ff9ad5"/>
+  <circle cx="128" cy="232" r="4" fill="#ff6fbe"/>
+  <circle cx="32"  cy="128" r="4" fill="#ff6fbe"/>
+</svg>

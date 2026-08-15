@@ -1,0 +1,63 @@
+version: "3.8"
+
+# JARVIS Voice Assistant — DRUGA instancja dla profilu Danka („JARVIS Mama").
+# Osobna apka Umbrel (bob-jarvis-mama) wskazująca TEN SAM obraz co bob-jarvis-voice.
+# Różnice vs JARVIS główny:
+#   - HUD na zewn. porcie 8767 (wewnętrzny 8766)  — nie koliduje z :8766 Głównego
+#   - dashboard proxy na zewn. 9444 (wewn. 9443)
+#   - HERMES_BASE_URL -> hermes-agent_web_1:8644  = profil hermese Danka (własny API server)
+#   - własny named volume jarvis-mama_jarvis-data (osobny .env, certy, config, token)
+# Tryb pojedyńczego profilu: brak profiles.list -> cały chat+voice idzie na Danka.
+# Wspólna sieć docker z hermes-agent (umbrel_main_network).
+
+services:
+  # Umbrel app-proxy: serwuje HUD + WebSocket audio. APP_PORT == port HUD (8765).
+  app_proxy:
+    environment:
+      APP_HOST: bob-jarvis-mama_jarvis_1
+      APP_PORT: 8765
+
+  jarvis:
+    image: ghcr.io/agentaibob/jarvis-voice:0.1.4
+    restart: on-failure
+    stop_grace_period: 1m
+    init: true
+    user: root
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - jarvis-data:/opt/data
+    # Publikowane na LAN: HUD (direct TLS) 8767 + dashboard proxy 9444.
+    # Zewnętrzny 8767 -> wewnętrzny 8766 (server.yaml tls_ports). Mama otwiera
+    # https://<host-ip>:8767/hud/
+    ports:
+      - "8767:8766"
+      - "9444:9443"
+    environment:
+      # -> profil Danka (osobny API server na 8644, włączony w profiles/danka/.env)
+      HERMES_BASE_URL: "http://hermes-agent_web_1:8644"
+      # STT (Whisper) cache na wolumenie (read_only rootfs).
+      HF_HOME: /opt/data/.cache/huggingface
+    networks:
+      - default
+      - hermes
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;r=urllib.request.urlopen('http://127.0.0.1:8765/hud/',timeout=4);exit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+networks:
+  hermes:
+    external: true
+    name: umbrel_main_network
+
+volumes:
+  jarvis-data:
+    name: jarvis-mama_jarvis-data
