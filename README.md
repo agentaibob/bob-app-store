@@ -3,7 +3,7 @@
 Community App Store z aplikacjami autorstwa Boba. Dodaj URL:
 `https://github.com/agentaibob/bob-app-store`
 
-![Netmon](https://img.shields.io/badge/netmon-1.0.26-green) ![Garmin](https://img.shields.io/badge/garmin-1.0.4-green) ![Hermes Monitor](https://img.shields.io/badge/hermes_monitor-1.13.5-green)
+![Netmon](https://img.shields.io/badge/netmon-1.0.26-green) ![Garmin](https://img.shields.io/badge/garmin-1.0.4-green) ![Hermes Monitor](https://img.shields.io/badge/hermes_monitor-1.14.0-green)
 
 ---
 
@@ -47,17 +47,17 @@ Dashboard + home-screen widget for **Garmin Connect** data: daily rides, distanc
 ## 3. Hermes Monitor (bob-hermes-monitor)
 
 Dashboard + home-screen widget for **Hermes Agent**: live gateway & profile status,
-token usage and cost, cron jobs, kanban board, API key health and logs.
+token usage and cost, cron jobs and vigilance/health signals.
 
 - Port: 8126
 - Reads Hermes data **read-only** (host path
-  `/home/umbrel/umbrel/app-data/hermes-agent/data/hermes` → `/hermes-data`); shows
-  API keys by variable **name only, never value**
-- Widget (three-stats): profile online, tokens total, cost total (est.) — każdy z ikoną
-- Dashboard: KPI, wykorzystanie tokenów/kosztów, Top modele (tabela), ostatnie sesje (10),
-  status Gateway (w tym mostek Signal), klucze API, kanban, system
+  `/home/umbrel/umbrel/app-data/hermes-agent/data/hermes` → `/hermes-data`)
+- Widget (three-stats): profile online, tokens total, cost total (est.)
+- Dashboard: KPI, wykorzystanie tokenów/kosztów, top modele (tabela), ostatnie sesje,
+  pełny status gateway per-profil (kropka stanu, pid, uptime, błędy, cron, platformy),
+  system
 - Endpoints: `/` (dashboard), `/api/health`, `/api/status`, `/api/sessions`,
-  `/api/usage`, `/api/cron/jobs`, `/api/kanban`, `/api/keys`, `/api/alerts`,
+  `/api/usage`, `/api/cron/jobs`, `/api/alerts`,
   `/api/metrics/{name}`, `/widgets/hermes`
 
 ---
