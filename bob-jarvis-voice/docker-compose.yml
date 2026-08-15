@@ -28,7 +28,7 @@ services:
   jarvis:
     # Obraz budowany z server/Dockerfile (kontekst server/) i wypychany do
     # rejestru — patrz docs/RELEASE_v012.md. Stąd adres bez `build:`.
-    image: ghcr.io/agentaibob/jarvis-voice:0.1.3
+    image: ghcr.io/agentaibob/jarvis-voice:0.1.4
     restart: on-failure
     stop_grace_period: 1m
     init: true
@@ -47,11 +47,18 @@ services:
     volumes:
       # NAMED VOLUME — trwałość apki (zamiast bind mounta).
       - jarvis-data:/opt/data
+    # Porty publikowane na LAN — ustawione TUTAJ (nie ręcznie na hoście),
+    # żeby update apki przez Umbrel Store NIE gubil ich przy nadpisywaniu
+    # docker-compose.yml. 8766 = HUD (direct TLS), 9443 = dashboard proxy.
+    ports:
+      - "8766:8766"
+      - "9443:9443"
     environment:
       # Serwer czyta config/logi z $JARVIS_DATA_DIR (ustawione w obrazie).
       HERMES_BASE_URL: "http://hermes-agent_web_1:8642"  # wspólna sieć docker
-      # Opcjonalny dodatkowy port HUD (direct TLS z certami w /opt/data/certs):
-      # JARVIS_HUD_PORT: "8766"
+      # STT (Whisper) cache na wolumenie — read_only rootfs nie pozwala
+      # pisac do /root/.cache. Tez TUTAJ, by update nie kasowal.
+      HF_HOME: /opt/data/.cache/huggingface
     networks:
       - default
       - hermes          # wspólna sieć z apką hermes-agent
