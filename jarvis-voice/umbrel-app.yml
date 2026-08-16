@@ -1,0 +1,36 @@
+manifestVersion: 1
+id: bob-jarvis-voice
+name: JARVIS Voice Assistant
+tagline: Głosowy asystent i HUD w stylu Iron Mana dla Hermes Agent
+icon: https://raw.githubusercontent.com/agentaibob/bob-app-store/main/bob-jarvis-voice/icon.svg
+category: AI
+version: "0.1.5"
+port: 8765
+description: >-
+  JARVIS Voice Assistant to self-hostowany asystent głosowy podłączony do
+  Hermes Agent — mówisz, on faktycznie działa (pamięć, narzędzia, terminal,
+  web). Holograficzny HUD w przeglądarce z pierścieniem reaktora, transkrypcją
+  na żywo, feedem narzędzi, przyciskiem STOP, kartami aprobaty i panelami
+  medialnymi. HUD pokazuje rzeczywistą nazwę hosta oraz aktywny loadout modeli.
+  STT działa lokalnie (faster-whisper) albo przez zgodne z OpenAI whisper-1;
+  TTS: Edge, ElevenLabs lub OpenAI-compatible gpt-4o-mini-tts z fallbackiem
+  Edge. Dostępne są barge-in i przełącznik profilu Hermes. Nowość w 0.1.3:
+  tryb hands-free (wake word "Jarvis") — przeglądarka trzyma mikrofon, a
+  lokalny silnik sherpa-onnx (offline, bez klucza) budzi rozmowę na słowo
+  "Jarvis" i sam wraca do snu po ciszy. HUD pokazuje wersję JARVIS-a.
+
+
+  Wymaga apki Hermes Agent (łączy się po wspólnej sieci docker z
+  hermes-agent_web_1:8642). LAN only — nie wystawiaj do internetu.
+
+
+  Sekrety (JARVIS_HUD_TOKEN, API_SERVER_KEY, ELEVENLABS_API_KEY, HERMES_BASE_URL)
+  konfiguruje się w pliku .env na named volume apki (/opt/data/.env). Serwer
+  nie startuje bez JARVIS_HUD_TOKEN i API_SERVER_KEY (fail-closed).
+developer: Bob
+website: https://github.com/agentaibob/bob-app-store
+submitter: Tomek
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
