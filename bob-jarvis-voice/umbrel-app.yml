@@ -4,7 +4,7 @@ name: JARVIS Voice Assistant
 tagline: Głosowy asystent i HUD w stylu Iron Mana dla Hermes Agent
 icon: https://raw.githubusercontent.com/agentaibob/bob-app-store/main/bob-jarvis-voice/icon.svg
 category: AI
-version: "0.1.4"
+version: "0.1.5"
 port: 8765
 description: >-
   JARVIS Voice Assistant to self-hostowany asystent głosowy podłączony do
