@@ -4,7 +4,7 @@ name: JARVIS Mama
 tagline: Osobny asystent głosowy Danki (profil danka) dla Hermes Agent
 icon: https://raw.githubusercontent.com/agentaibob/bob-app-store/main/bob-jarvis-mama/icon.svg
 category: AI
-version: "0.1.6"
+version: "0.1.7"
 port: 8768
 description: >-
   Druga, osobna instancja JARVIS-a (ten sam obraz co JARVIS główny), skierowana
