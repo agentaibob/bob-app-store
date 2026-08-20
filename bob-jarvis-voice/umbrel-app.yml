@@ -4,7 +4,7 @@ name: JARVIS Voice Assistant
 tagline: Głosowy asystent i HUD w stylu Iron Mana dla Hermes Agent
 icon: https://raw.githubusercontent.com/agentaibob/bob-app-store/main/bob-jarvis-voice/icon.svg
 category: AI
-version: "0.1.9"
+version: "0.1.10"
 port: 8765
 description: >-
   JARVIS Voice Assistant to self-hostowany asystent głosowy podłączony do
@@ -20,7 +20,9 @@ description: >-
   "bob") i sam wraca do snu po ciszy. Nowość w 0.1.9: pauza/wznowienie mowy
   (❚❚/▶) oraz STOP zachowujący pisemną odpowiedź — przerwanie wypowiedzi nie
   kasuje już tekstu w HUD; wake word przerywa mówienie (barge-in głosowy).
-  HUD pokazuje wersję JARVIS-a.
+  Nowość w 0.1.10: barge-in "bob" działa też w trybie ENGAGE (pełny dupleks),
+  polskie "hej bob", czulsza detekcja i przyciski pauzy/stop dostępne przez
+  całą wypowiedź. HUD pokazuje wersję JARVIS-a.
 
 
   Wymaga apki Hermes Agent (łączy się po wspólnej sieci docker z
