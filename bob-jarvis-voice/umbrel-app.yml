@@ -4,7 +4,7 @@ name: JARVIS Voice Assistant
 tagline: Głosowy asystent i HUD w stylu Iron Mana dla Hermes Agent
 icon: https://raw.githubusercontent.com/agentaibob/bob-app-store/main/bob-jarvis-voice/icon.svg
 category: AI
-version: "0.1.8"
+version: "0.1.9"
 port: 8765
 description: >-
   JARVIS Voice Assistant to self-hostowany asystent głosowy podłączony do
@@ -15,9 +15,12 @@ description: >-
   STT działa lokalnie (faster-whisper) albo przez zgodne z OpenAI whisper-1;
   TTS: Edge, ElevenLabs lub OpenAI-compatible gpt-4o-mini-tts z fallbackiem
   Edge. Dostępne są barge-in i przełącznik profilu Hermes. Nowość w 0.1.3:
-  tryb hands-free (wake word "Jarvis") — przeglądarka trzyma mikrofon, a
-  lokalny silnik sherpa-onnx (offline, bez klucza) budzi rozmowę na słowo
-  "Jarvis" i sam wraca do snu po ciszy. HUD pokazuje wersję JARVIS-a.
+  tryb hands-free (wake word) — przeglądarka trzyma mikrofon, a lokalny silnik
+  sherpa-onnx (offline, bez klucza) budzi rozmowę na wybrane słowo (domyślnie
+  "bob") i sam wraca do snu po ciszy. Nowość w 0.1.9: pauza/wznowienie mowy
+  (❚❚/▶) oraz STOP zachowujący pisemną odpowiedź — przerwanie wypowiedzi nie
+  kasuje już tekstu w HUD; wake word przerywa mówienie (barge-in głosowy).
+  HUD pokazuje wersję JARVIS-a.
 
 
   Wymaga apki Hermes Agent (łączy się po wspólnej sieci docker z
