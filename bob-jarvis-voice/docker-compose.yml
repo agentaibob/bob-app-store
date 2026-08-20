@@ -28,7 +28,7 @@ services:
   jarvis:
     # Obraz budowany z server/Dockerfile (kontekst server/) i wypychany do
     # rejestru — patrz docs/RELEASE_v012.md. Stąd adres bez `build:`.
-    image: ghcr.io/agentaibob/jarvis-voice:0.1.11
+    image: ghcr.io/agentaibob/jarvis-voice:0.1.12
     restart: on-failure
     stop_grace_period: 1m
     init: true
