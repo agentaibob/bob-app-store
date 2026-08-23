@@ -3,7 +3,7 @@
 Community App Store z aplikacjami autorstwa Boba. Dodaj URL:
 `https://github.com/agentaibob/bob-app-store`
 
-![Netmon](https://img.shields.io/badge/netmon-1.0.34-green) ![Garmin](https://img.shields.io/badge/garmin-1.0.4-green) ![Hermes Monitor](https://img.shields.io/badge/hermes_monitor-1.24.0-green)
+![Netmon](https://img.shields.io/badge/netmon-1.0.34-green) ![Garmin](https://img.shields.io/badge/garmin-1.0.4-green) ![Hermes Monitor](https://img.shields.io/badge/hermes_monitor-1.24.0-green) ![Raspberry Monitor](https://img.shields.io/badge/raspberry_monitor-0.1.0-green)
 
 ---
 
@@ -59,6 +59,35 @@ token usage and cost, cron jobs and vigilance/health signals.
 - Endpoints: `/` (dashboard), `/api/health`, `/api/status`, `/api/sessions`,
   `/api/usage`, `/api/cron/jobs`, `/api/alerts`,
   `/api/metrics/{name}`, `/widgets/hermes`
+
+---
+
+## 4. Raspberry Monitor (bob-raspberry-monitor)
+
+Dashboard monitorujący **Raspberry Pi 4 Model B** (192.168.0.253) oraz usługi
+działające na nim: **Signal Gateway** (mostek signal-cli dla profili Hermes)
+i **Hades Gateway** (serwer WireGuard z wyjściem przez sieć Tor).
+
+- Port: 8127
+- Wymaga hasła SSH do Raspberry Pi (użytkownik `duzy102`) — konfigurowane
+  w formularzu aplikacji, zapisywane lokalnie (`config.json`)
+- Odświeżanie co 5 sekund; dane zbierane przez SSH co 5 s
+- Sekcje:
+  - **Raspberry Pi 4 Model B** — poziomy panel: temperatura, CPU load, RAM,
+    dysk, uptime, IP LAN, kontenery Docker (kropki stanu, paski użycia)
+  - **Signal Gateway** — pionowe panele per profil Hermes z Signala
+    (Tomasz Signal, Perun Signal): status kontenera, konto w bridge,
+    błędy reconnect, ostatni log
+  - **Hades Gateway · WireGuard Server** — panel serwera (klucz, port 51821,
+    podsieć, ruch do Tora) + pionowe panele per urządzenie (telefon, gamepc,
+    sleeppc, asus, dell): handshake z czasem, transfer Odebrano/Wysłano,
+    status UP/DOWN
+  - **Hades Gateway · Tor Network** — wersja Tora, Bootstrap %, publiczne IP
+    domu i IP wyjścia przez Tora, licznik ruchu DNAT + panele urządzeń
+  - **Hades Gateway · Hades Traffic Flow** — wykres Sankeya
+    (urządzenie → WireGuard → Tor → Internet) + panele MB per urządzenie
+- Endpoints: `/` (dashboard), `/api/snapshot`, `/api/config`,
+  `/health`
 
 ---
 

@@ -1,0 +1,24 @@
+manifestVersion: 1
+id: bob-raspberry-monitor
+name: Raspberry Monitor
+tagline: Raspberry Pi, Signal Gateway i Hades (WireGuard+Tor) w jednym panelu
+icon: https://raw.githubusercontent.com/agentaibob/bob-app-store/main/bob-raspberry-monitor/icon.svg
+category: Utilities
+version: "0.1.0"
+port: 8127
+description: >-
+  Dashboard monitorujący Raspberry Pi 4 Model B (192.168.0.253) oraz działające
+  na nim usługi: Signal Gateway (mostek signal-cli dla profili Hermes) i Hades
+  Gateway (serwer WireGuard z wyjściem przez sieć Tor). Sekcje: parametry Pi
+  (temperatura, CPU, RAM, dysk, uptime), panele profili Signal, lista urządzeń
+  WireGuard z handshake i transferem, stan sieci Tor oraz przepływ ruchu
+  (wykres Sankey urządzenie -> WireGuard -> Tor -> Internet) z licznikami MB.
+  Wymaga hasła SSH do Raspberry Pi (użytkownik duzy102), konfigurowanego
+  w formularzu aplikacji. Odświeżanie co 5 sekund.
+developer: Bob
+website: https://github.com/agentaibob/bob-app-store
+submitter: Tomek
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
