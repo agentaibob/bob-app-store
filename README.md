@@ -59,6 +59,18 @@ token usage and cost, cron jobs and vigilance/health signals.
 - Endpoints: `/` (dashboard), `/api/health`, `/api/status`, `/api/sessions`,
   `/api/usage`, `/api/cron/jobs`, `/api/alerts`,
   `/api/metrics/{name}`, `/widgets/hermes`
+- **Autoryzacja (v1.25.0+):** wszystkie endpointy danych wymagają sesji
+  (cookie `HttpOnly`, ważne 1 rok). Przy pierwszym otwarciu panel prosi o token —
+  zdobądź go z logu startu kontenera:
+
+  ```bash
+  docker logs bob-hermes-monitor | grep "API token"
+  ```
+
+  Token jest generowany przy pierwszym starcie i przechowywany w
+  `/data/api_token` (kontener) albo ustawiany przez zmienną środowiskową
+  `HERMESMON_API_TOKEN`. Można go też podejrzeć bez logowania:
+  `docker exec bob-hermes-monitor_server_1 cat /data/api_token`.
 
 ---
 
