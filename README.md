@@ -3,7 +3,7 @@
 Community App Store z aplikacjami autorstwa Boba. Dodaj URL:
 `https://github.com/agentaibob/bob-app-store`
 
-![Netmon](https://img.shields.io/badge/netmon-1.0.34-green) ![Garmin](https://img.shields.io/badge/garmin-1.0.4-green) ![Hermes Monitor](https://img.shields.io/badge/hermes_monitor-1.24.0-green) ![Raspberry Monitor](https://img.shields.io/badge/raspberry_monitor-0.1.3-green)
+![Netmon](https://img.shields.io/badge/netmon-1.0.34-green) ![Garmin](https://img.shields.io/badge/garmin-1.0.4-green) ![Hermes Monitor](https://img.shields.io/badge/hermes_monitor-1.24.0-green) ![Raspberry Monitor](https://img.shields.io/badge/raspberry_monitor-0.1.4-green)
 
 ---
 
@@ -79,7 +79,7 @@ i **Hades Gateway** (serwer WireGuard z wyjściem przez sieć Tor).
     (Tomasz Signal, Perun Signal): status kontenera, konto w bridge,
     błędy reconnect, ostatni log
   - **Hades Gateway · WireGuard Server** — panel serwera (klucz, port 51821,
-    podsieć, ruch do Tora) + pionowe panele per urządzenie (telefon, gamepc,
+    podsieć, ruch do Tora) + pionowe panele per urządzenie (z4, gamepc,
     sleeppc, asus, dell): handshake z czasem, transfer Odebrano/Wysłano,
     status UP/DOWN
   - **Hades Gateway · Tor Network** — wersja Tora, Bootstrap %, publiczne IP
