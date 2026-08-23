@@ -3,7 +3,7 @@
 Community App Store z aplikacjami autorstwa Boba. Dodaj URL:
 `https://github.com/agentaibob/bob-app-store`
 
-![Netmon](https://img.shields.io/badge/netmon-1.0.34-green) ![Garmin](https://img.shields.io/badge/garmin-1.0.4-green) ![Hermes Monitor](https://img.shields.io/badge/hermes_monitor-1.24.0-green) ![Raspberry Monitor](https://img.shields.io/badge/raspberry_monitor-0.1.7-green)
+![Netmon](https://img.shields.io/badge/netmon-1.0.34-green) ![Garmin](https://img.shields.io/badge/garmin-1.0.4-green) ![Hermes Monitor](https://img.shields.io/badge/hermes_monitor-1.24.0-green) ![Raspberry Monitor](https://img.shields.io/badge/raspberry_monitor-0.1.8-green)
 
 ---
 
